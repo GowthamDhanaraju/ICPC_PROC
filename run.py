@@ -160,37 +160,14 @@ def parse_gdrive_id(url: str) -> str:
 
 def download_gdrive_file(file_id: str, dest_path: str):
     """
-    Downloads a publicly accessible file from Google Drive.
+    Downloads a publicly accessible file from Google Drive using the gdown library.
     """
-    url = "https://docs.google.com/uc?export=download"
-    session = requests.Session()
-    print(f"Connecting to Google Drive to download file ID: {file_id}...")
-    response = session.get(url, params={'id': file_id}, stream=True)
-    
-    # Confirm download warning check for large files
-    token = None
-    for key, value in response.cookies.items():
-        if key.startswith('download_warning'):
-            token = value
-            break
-            
-    if token:
-        print("Handling Google Drive warning bypass for large files...")
-        response = session.get(url, params={'id': file_id, 'confirm': token}, stream=True)
-        
-    response.raise_for_status()
-    
+    import gdown
+    url = f"https://drive.google.com/uc?id={file_id}"
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-    print(f"Downloading stream into: {dest_path}")
-    
-    total_downloaded = 0
-    with open(dest_path, 'wb') as f:
-        for chunk in response.iter_content(chunk_size=1024*1024):
-            if chunk:
-                f.write(chunk)
-                total_downloaded += len(chunk)
-                print(f"Downloaded {total_downloaded / (1024*1024):.1f} MB...", end="\r", flush=True)
-    print(f"\nDownload complete. Total size: {total_downloaded / (1024*1024):.1f} MB")
+    print(f"Connecting and downloading file ID: {file_id} via gdown...")
+    # gdown automatically handles virus warnings and chunks large downloads
+    gdown.download(url, dest_path, quiet=False, use_cookies=False)
 
 def run_gdrive_test(url: str, candidate_id: str):
     """
