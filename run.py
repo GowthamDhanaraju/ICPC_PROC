@@ -141,9 +141,129 @@ def run_e2e_test():
         
     print("\n=== E2E TEST COMPLETED SUCCESSFULLY ===")
 
+import re
+import requests
+
+def parse_gdrive_id(url: str) -> str:
+    """
+    Parses Google Drive share URL and extracts the file ID.
+    """
+    match = re.search(r'/file/d/([a-zA-Z0-9_-]+)', url)
+    if match:
+        return match.group(1)
+    match = re.search(r'id=([a-zA-Z0-9_-]+)', url)
+    if match:
+        return match.group(1)
+    if re.match(r'^[a-zA-Z0-9_-]{25,}$', url):
+        return url
+    raise ValueError(f"Could not extract Google Drive File ID from: {url}")
+
+def download_gdrive_file(file_id: str, dest_path: str):
+    """
+    Downloads a publicly accessible file from Google Drive.
+    """
+    url = "https://docs.google.com/uc?export=download"
+    session = requests.Session()
+    print(f"Connecting to Google Drive to download file ID: {file_id}...")
+    response = session.get(url, params={'id': file_id}, stream=True)
+    
+    # Confirm download warning check for large files
+    token = None
+    for key, value in response.cookies.items():
+        if key.startswith('download_warning'):
+            token = value
+            break
+            
+    if token:
+        print("Handling Google Drive warning bypass for large files...")
+        response = session.get(url, params={'id': file_id, 'confirm': token}, stream=True)
+        
+    response.raise_for_status()
+    
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    print(f"Downloading stream into: {dest_path}")
+    
+    total_downloaded = 0
+    with open(dest_path, 'wb') as f:
+        for chunk in response.iter_content(chunk_size=1024*1024):
+            if chunk:
+                f.write(chunk)
+                total_downloaded += len(chunk)
+                print(f"Downloaded {total_downloaded / (1024*1024):.1f} MB...", end="\r", flush=True)
+    print(f"\nDownload complete. Total size: {total_downloaded / (1024*1024):.1f} MB")
+
+def run_gdrive_test(url: str, candidate_id: str):
+    """
+    Downloads a Google Drive video file and runs the local proctoring pipeline on it.
+    """
+    if not url:
+        print("Error: --url parameter is required when running test-gdrive mode.")
+        sys.exit(1)
+        
+    try:
+        file_id = parse_gdrive_id(url)
+    except Exception as e:
+        print(f"URL Parsing Error: {e}")
+        sys.exit(1)
+        
+    video_key = f"gdrive_{file_id}/video.mp4"
+    local_video_path = os.path.join(settings.LOCAL_STORAGE_DIR, settings.SOURCE_S3_BUCKET, video_key)
+    
+    # Download file from Google Drive if it doesn't already exist
+    if not os.path.exists(local_video_path):
+        try:
+            download_gdrive_file(file_id, local_video_path)
+        except Exception as e:
+            print(f"Failed to download Google Drive video: {e}")
+            sys.exit(1)
+    else:
+        print(f"Google Drive video already downloaded at: {local_video_path}")
+        
+    # Ensure database is initialized
+    init_db()
+    
+    # Spin up server in background thread
+    server_thread = threading.Thread(target=run_api_server, daemon=True)
+    server_thread.start()
+    
+    # Wait for server to boot
+    time.sleep(3.0)
+    
+    # Initialize client and submit job
+    client = ProctoringClient("http://127.0.0.1:8000")
+    s3_uri = f"s3://{settings.SOURCE_S3_BUCKET}/{video_key}"
+    webhook_url = "http://127.0.0.1:8000/test/webhook-target"
+    
+    print(f"Submitting job via Client SDK for {s3_uri}...")
+    res = client.submit_session(
+        candidate_id=candidate_id,
+        video_s3_uri=s3_uri,
+        webhook_url=webhook_url
+    )
+    job_id = res["job_id"]
+    print(f"Job submitted! Job ID: {job_id}")
+    
+    # Poll status
+    print("Polling job status until execution completes...")
+    try:
+        final_result = client.poll_session_until_complete(job_id, interval=2.0, timeout=600.0)
+        print("\n=== PIPELINE EXECUTION COMPLETED ===")
+        print(f"Job Status: {final_result['status']}")
+        print(f"Overall Fairness Score: {final_result['overall_score']}/100")
+        print("\nDetected Violations Timeline:")
+        for v in final_result["violations"]:
+            print(f" - {v['type']}: {v['start_ts']} -> {v['end_ts']} ({v['duration']:.1f}s, Conf: {v['confidence']:.2f})")
+            if v['evidence_frame_s3_uri']:
+                print(f"   Evidence S3 URI: {v['evidence_frame_s3_uri']}")
+    except Exception as e:
+        print(f"Gdrive test run failed: {e}")
+        sys.exit(1)
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Proctoring Pipeline Control CLI")
-    parser.add_argument("mode", choices=["api", "worker", "test-e2e"], help="Execution mode")
+    parser.add_argument("mode", choices=["api", "worker", "test-e2e", "test-gdrive"], help="Execution mode")
+    parser.add_argument("--url", help="Google Drive shared file URL (required for test-gdrive)")
+    parser.add_argument("--candidate", default="gdrive_candidate", help="Candidate ID for test-gdrive")
     args = parser.parse_args()
     
     if args.mode == "api":
@@ -152,3 +272,5 @@ if __name__ == "__main__":
         run_sqs_worker()
     elif args.mode == "test-e2e":
         run_e2e_test()
+    elif args.mode == "test-gdrive":
+        run_gdrive_test(args.url, args.candidate)
