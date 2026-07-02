@@ -1,0 +1,22 @@
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environments
+.venv/
+env/
+venv/
+ENV/
+
+# Database files
+*.db
+*.sqlite3
+
+# Local storage mocks and S3 downlods
+storage/
+
+# OS files
+.DS_Store
+Thumbs.db

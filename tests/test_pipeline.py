@@ -86,7 +86,7 @@ def test_aggregator_merge_and_debounce_keep():
     assert violations[0]["start_ts"] == 10.0
     assert violations[0]["end_ts"] == 12.0
     assert violations[0]["duration"] == 2.0
-    assert violations[0]["confidence"] == 0.85
+    assert pytest.approx(violations[0]["confidence"]) == 0.85
 
 def test_scoring_engine_diminishing_marginal_penalty():
     """Verify that scoring applies penalties and scales down marginal repeats geometrically/sub-linearly."""
