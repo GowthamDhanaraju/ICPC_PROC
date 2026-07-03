@@ -44,22 +44,23 @@ def run_api_server(host: str = "127.0.0.1"):
     """Runs the FastAPI server using Uvicorn."""
     uvicorn.run("app.main:app", host=host, port=8000, log_level="info")
 
-def wait_for_server(url: str = "http://127.0.0.1:8000/test/webhook-received", timeout: float = 60.0):
+def wait_for_server(url: str = "http://127.0.0.1:8000/health", timeout: float = 60.0):
     """
     Waits for the background FastAPI server to open port 8000 and boot up.
+    Uses /health which is always mounted regardless of TESTING_MODE.
     """
     import requests
-    print("Waiting for API server to boot up (loading ML frameworks)...")
+    print("Waiting for API server to boot up...")
     start_time = time.time()
     while time.time() - start_time < timeout:
         try:
             response = requests.get(url, timeout=1.0)
             if response.status_code == 200:
-                print(f"API server booted successfully in {time.time() - start_time:.1f}s.")
+                print(f"API server ready in {time.time() - start_time:.1f}s.")
                 return
         except requests.exceptions.RequestException:
             pass
-        time.sleep(1.0)
+        time.sleep(0.5)
     print("Error: API server failed to boot within timeout limit.")
     sys.exit(1)
 
@@ -99,9 +100,9 @@ def run_e2e_test():
     6. Shuts down and exits.
     """
     print("=== STARTING END-TO-END PROCTORING PIPELINE TEST ===")
-    
+
     # Ensure database is initialized
-    os.environ["TESTING_MODE"] = "True"
+    settings.TESTING_MODE = True  # Mutate singleton so test router mounts correctly
     init_db()
     
     # Define file paths
@@ -217,7 +218,7 @@ def run_gdrive_test(url: str, candidate_id: str):
         print(f"Google Drive video already downloaded at: {local_video_path}")
         
     # Ensure database is initialized
-    os.environ["TESTING_MODE"] = "True"
+    settings.TESTING_MODE = True  # Mutate singleton so test router mounts correctly
     init_db()
     
     # Spin up server in background thread
@@ -257,13 +258,93 @@ def run_gdrive_test(url: str, candidate_id: str):
         print(f"Gdrive test run failed: {e}")
         sys.exit(1)
 
+def run_local_test(video_path: str, candidate_id: str):
+    """
+    Runs the proctoring pipeline directly on a local video file.
+    Skips all download steps — useful for re-testing an already-downloaded file.
+    """
+    if not video_path:
+        print("Error: --file parameter is required for test-local mode.")
+        sys.exit(1)
+
+    video_path = os.path.abspath(video_path)
+    if not os.path.exists(video_path):
+        print(f"Error: File not found: {video_path}")
+        sys.exit(1)
+
+    file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+    print(f"=== LOCAL FILE PROCTORING TEST ===")
+    print(f"Video: {video_path} ({file_size_mb:.1f} MB)")
+    print(f"Candidate: {candidate_id}")
+
+    # Build a relative S3-like key from the path so the worker resolves it correctly
+    # The S3 URI will map back to the absolute local path via get_local_path()
+    video_key = f"local/{candidate_id}/video.mp4"
+    local_storage_dir = os.path.abspath(settings.LOCAL_STORAGE_DIR)
+    dest_path = os.path.join(local_storage_dir, settings.SOURCE_S3_BUCKET, video_key)
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+
+    # Symlink or copy if not already at destination
+    if os.path.abspath(dest_path) != video_path:
+        if os.path.exists(dest_path):
+            os.remove(dest_path)
+        try:
+            os.symlink(video_path, dest_path)
+        except (OSError, NotImplementedError):
+            import shutil
+            shutil.copy2(video_path, dest_path)
+        print(f"Linked video into storage: {dest_path}")
+    else:
+        print(f"Video already at storage path.")
+
+    settings.TESTING_MODE = True  # Mutate singleton so test router mounts correctly
+    init_db()
+
+    # Spin up server
+    server_thread = threading.Thread(target=run_api_server, daemon=True)
+    server_thread.start()
+    wait_for_server()
+
+    client = ProctoringClient("http://127.0.0.1:8000")
+    s3_uri = f"s3://{settings.SOURCE_S3_BUCKET}/{video_key}"
+    webhook_url = "http://127.0.0.1:8000/test/webhook-target"
+
+    print(f"Submitting job for {s3_uri}...")
+    res = client.submit_session(
+        candidate_id=candidate_id,
+        video_s3_uri=s3_uri,
+        webhook_url=webhook_url
+    )
+    job_id = res["job_id"]
+    print(f"Job submitted! ID: {job_id}")
+
+    print("Polling until pipeline completes (this may take several minutes for long videos)...")
+    try:
+        final = client.poll_session_until_complete(job_id, interval=3.0, timeout=7200.0)
+        print("\n=== PIPELINE COMPLETED ===")
+        print(f"Job Status : {final['status']}")
+        print(f"Fairness Score: {final['overall_score']}/100")
+        print("\nViolation Timeline:")
+        for v in final["violations"]:
+            print(f"  [{v['type']}] {v['start_ts']} → {v['end_ts']} "
+                  f"({v['duration']:.1f}s, conf={v['confidence']:.2f})")
+            if v.get('evidence_frame_s3_uri'):
+                print(f"    Evidence: {v['evidence_frame_s3_uri']}")
+        if not final["violations"]:
+            print("  No violations detected.")
+    except Exception as e:
+        print(f"Test failed: {e}")
+        sys.exit(1)
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Proctoring Pipeline Control CLI")
-    parser.add_argument("mode", choices=["api", "worker", "test-e2e", "test-gdrive"], help="Execution mode")
+    parser.add_argument("mode", choices=["api", "worker", "test-e2e", "test-gdrive", "test-local"],
+                        help="Execution mode")
     parser.add_argument("--url", help="Google Drive shared file URL (required for test-gdrive)")
-    parser.add_argument("--candidate", default="gdrive_candidate", help="Candidate ID for test-gdrive")
+    parser.add_argument("--file", help="Local video file path (required for test-local)")
+    parser.add_argument("--candidate", default="test_candidate", help="Candidate ID")
     args = parser.parse_args()
-    
+
     if args.mode == "api":
         run_api_server(host="0.0.0.0")
     elif args.mode == "worker":
@@ -272,3 +353,5 @@ if __name__ == "__main__":
         run_e2e_test()
     elif args.mode == "test-gdrive":
         run_gdrive_test(args.url, args.candidate)
+    elif args.mode == "test-local":
+        run_local_test(args.file, args.candidate)
