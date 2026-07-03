@@ -45,8 +45,7 @@ soundfile>=0.12.1
 # Uncomment to enable DIARIZATION_BACKEND=pyannote
 # pyannote.audio>=3.1.0
 
-# --- Audio ---
-scipy==1.13.1
+scipy>=1.13.1
 
 # --- AWS ---
 boto3==1.34.144
