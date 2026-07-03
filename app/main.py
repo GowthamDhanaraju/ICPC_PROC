@@ -1,134 +1,219 @@
-from fastapi import FastAPI, Depends, HTTPException, status
-from pydantic import BaseModel, HttpUrl
-from typing import Optional, List
+"""
+FastAPI application entrypoint for the Batch Video Proctoring Pipeline.
+
+Key changes vs. original:
+- Uses @asynccontextmanager lifespan instead of deprecated @app.on_event("startup").
+- /health and /ready endpoints for Kubernetes / ECS health probes.
+- Test routes (/test/*) are only mounted when TESTING_MODE=True.
+- Pydantic schemas imported from app.schemas (not inline).
+- Request logging middleware.
+"""
+import logging
+from contextlib import asynccontextmanager
+
+from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
-from app.database import init_db, get_db, Job
+
 from app.config import settings
+from app.database import get_db, init_db, Job, engine
+from app.logging_config import configure_logging
 from app.orchestration.queue import global_queue
-
-# Pydantic schemas for request validation
-class JobCreate(BaseModel):
-    candidate_id: str
-    video_s3_uri: str
-    enrollment_photo_s3_uri: Optional[str] = None
-    webhook_url: Optional[str] = None
-
-class ViolationResponse(BaseModel):
-    type: str
-    start_ts: str
-    end_ts: str
-    start_seconds: float
-    end_seconds: float
-    duration: float
-    confidence: float
-    evidence_frame_s3_uri: Optional[str] = None
-
-class JobResponse(BaseModel):
-    job_id: str
-    candidate_id: str
-    status: str
-    source_video_s3_uri: str
-    enrollment_photo_s3_uri: Optional[str] = None
-    overall_score: Optional[float] = None
-    webhook_url: Optional[str] = None
-    error_message: Optional[str] = None
-    created_at: str
-    updated_at: str
-    violations: List[ViolationResponse]
-
-# Initialize FastAPI App
-app = FastAPI(
-    title="Batch Video Proctoring API",
-    description="S3 Event-driven / REST Batch proctoring pipeline analysis engine.",
-    version="0.1.0"
+from app.schemas import (
+    HealthResponse,
+    JobCreate,
+    JobResponse,
+    JobSubmitResponse,
+    ReadyResponse,
 )
 
-# Startup & Shutdown Lifecycles
-@app.on_event("startup")
-def startup_event():
-    print("Initializing Database tables...")
-    init_db()
-    print("Starting background job queue workers...")
-    global_queue.start(num_workers=2)
+configure_logging()
+logger = logging.getLogger(__name__)
 
-@app.on_event("shutdown")
-def shutdown_event():
-    print("Stopping background job queue workers...")
+
+# ---------------------------------------------------------------------------
+# Lifespan (replaces deprecated @app.on_event)
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup and shutdown lifecycle manager."""
+    logger.info("=== Proctoring API starting up ===")
+    settings.ensure_local_dirs()
+    init_db()
+    global_queue.start(num_workers=settings.WORKER_CONCURRENCY)
+    logger.info(f"Worker queue started with {settings.WORKER_CONCURRENCY} threads.")
+    yield
+    logger.info("=== Proctoring API shutting down ===")
     global_queue.stop()
 
-# API Endpoints
-@app.post("/v1/sessions", status_code=status.HTTP_201_CREATED)
+
+# ---------------------------------------------------------------------------
+# Application
+# ---------------------------------------------------------------------------
+
+app = FastAPI(
+    title="Batch Video Proctoring API",
+    description=(
+        "S3 event-driven / REST batch proctoring pipeline. "
+        "Submit a video S3 URI, poll for results, receive webhook callbacks."
+    ),
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Lightweight request logger — logs method, path, and response status."""
+    response = await call_next(request)
+    # Skip high-frequency health check noise
+    if request.url.path not in ("/health", "/ready"):
+        logger.info(f"{request.method} {request.url.path} → {response.status_code}")
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Health & Readiness Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/health", response_model=HealthResponse, tags=["Ops"])
+def health():
+    """
+    Liveness probe. Returns 200 if the process is running.
+    Used by Kubernetes / ECS to detect crash-looping containers.
+    """
+    return HealthResponse(status="ok", version=app.version)
+
+
+@app.get("/ready", response_model=ReadyResponse, tags=["Ops"])
+def ready(db: Session = Depends(get_db)):
+    """
+    Readiness probe. Checks that the database is reachable.
+    Returns 503 if any dependency is unavailable.
+    """
+    db_status = "ok"
+    try:
+        db.execute(__import__("sqlalchemy").text("SELECT 1"))
+    except Exception as exc:
+        logger.error(f"DB readiness check failed: {exc}")
+        db_status = "unavailable"
+
+    queue_status = "ok" if global_queue._running else "stopped"
+
+    if db_status != "ok":
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"status": "not_ready", "database": db_status, "queue": queue_status},
+        )
+
+    return ReadyResponse(status="ready", database=db_status, queue=queue_status)
+
+
+# ---------------------------------------------------------------------------
+# Proctoring API Endpoints
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/v1/sessions",
+    response_model=JobSubmitResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Proctoring"],
+)
 def submit_session(payload: JobCreate, db: Session = Depends(get_db)):
     """
     Submits a batch video proctoring job.
-    Inserts a job entry to database and queues it for background pipeline processing.
+    Inserts a job record into the database and queues it for background processing.
+    Idempotent: returns the existing job if one is already active for the same video + candidate.
     """
     try:
-        # Check for idempotency: if active job with same key exists, return it
         existing = db.query(Job).filter(
             Job.source_video_s3_uri == payload.video_s3_uri,
             Job.candidate_id == payload.candidate_id,
-            Job.status.in_(["QUEUED", "PROCESSING"])
+            Job.status.in_(["QUEUED", "PROCESSING"]),
         ).first()
-        
-        if existing:
-            return {
-                "job_id": existing.id,
-                "status": existing.status,
-                "message": "Job already exists and is queued/processing."
-            }
 
-        # Create new Job
+        if existing:
+            return JobSubmitResponse(
+                job_id=existing.id,
+                status=existing.status,
+                message="Active job already exists for this video and candidate.",
+            )
+
         job = Job(
             candidate_id=payload.candidate_id,
             source_video_s3_uri=payload.video_s3_uri,
             enrollment_photo_s3_uri=payload.enrollment_photo_s3_uri,
             webhook_url=payload.webhook_url,
-            status="QUEUED"
+            status="QUEUED",
         )
         db.add(job)
         db.commit()
         db.refresh(job)
-        
-        # Submit to internal work queue
+
         global_queue.submit(job.id)
-        
-        return {
-            "job_id": job.id,
-            "status": job.status
-        }
-    except Exception as e:
+        logger.info(f"Job {job.id} submitted for candidate {job.candidate_id}.")
+
+        return JobSubmitResponse(job_id=job.id, status=job.status)
+
+    except Exception as exc:
         db.rollback()
+        logger.error(f"Failed to submit proctoring job: {exc}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to submit proctoring job: {str(e)}"
+            detail=f"Failed to submit proctoring job: {exc}",
         )
 
-@app.get("/v1/sessions/{job_id}", response_model=JobResponse)
+
+@app.get(
+    "/v1/sessions/{job_id}",
+    response_model=JobResponse,
+    tags=["Proctoring"],
+)
 def get_session(job_id: str, db: Session = Depends(get_db)):
     """
-    Retrieves the status, score, and timeline violations of a proctoring job.
+    Returns the current status, score, and violation timeline for a proctoring job.
     """
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Proctoring job with ID {job_id} not found."
+            detail=f"Job {job_id} not found.",
         )
     return job.to_dict()
 
-# Mock target endpoint for local testing webhooks
-received_webhooks = []
 
-@app.post("/test/webhook-target", status_code=status.HTTP_200_OK)
-def test_webhook_target(payload: dict):
-    """
-    Local test webhook endpoint to log callback updates.
-    """
-    print(f"[TEST WEBHOOK RECEIVED] Job {payload.get('job_id')} status: {payload.get('status')} score: {payload.get('overall_score')}")
-    received_webhooks.append(payload)
-    return {"status": "accepted"}
+# ---------------------------------------------------------------------------
+# Test Routes (only mounted in TESTING_MODE)
+# ---------------------------------------------------------------------------
 
-@app.get("/test/webhook-received", response_model=List[dict])
-def get_received_webhooks():
-    return received_webhooks
+if settings.TESTING_MODE:
+    from fastapi import APIRouter
+    from typing import List
+
+    _received_webhooks: List[dict] = []
+    test_router = APIRouter(prefix="/test", tags=["Testing"])
+
+    @test_router.post("/webhook-target", status_code=200)
+    def test_webhook_target(payload: dict):
+        logger.info(
+            f"[TEST WEBHOOK] job={payload.get('job_id')} "
+            f"status={payload.get('status')} score={payload.get('overall_score')}"
+        )
+        _received_webhooks.append(payload)
+        return {"status": "accepted"}
+
+    @test_router.get("/webhook-received")
+    def get_received_webhooks():
+        return _received_webhooks
+
+    app.include_router(test_router)
+    logger.warning("TESTING_MODE=True — test routes are mounted. Do NOT use in production.")

@@ -40,9 +40,9 @@ def generate_dummy_video(path: str, duration_sec: float = 15.0, fps: float = 10.
     out.release()
     print(f"Successfully generated a {duration_sec}s dummy MP4 video at: {path}")
 
-def run_api_server():
+def run_api_server(host: str = "127.0.0.1"):
     """Runs the FastAPI server using Uvicorn."""
-    uvicorn.run("app.main:app", host="127.0.0.1", port=8000, log_level="info")
+    uvicorn.run("app.main:app", host=host, port=8000, log_level="info")
 
 def wait_for_server(url: str = "http://127.0.0.1:8000/test/webhook-received", timeout: float = 60.0):
     """
@@ -101,6 +101,7 @@ def run_e2e_test():
     print("=== STARTING END-TO-END PROCTORING PIPELINE TEST ===")
     
     # Ensure database is initialized
+    os.environ["TESTING_MODE"] = "True"
     init_db()
     
     # Define file paths
@@ -216,6 +217,7 @@ def run_gdrive_test(url: str, candidate_id: str):
         print(f"Google Drive video already downloaded at: {local_video_path}")
         
     # Ensure database is initialized
+    os.environ["TESTING_MODE"] = "True"
     init_db()
     
     # Spin up server in background thread
@@ -263,7 +265,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     if args.mode == "api":
-        run_api_server()
+        run_api_server(host="0.0.0.0")
     elif args.mode == "worker":
         run_sqs_worker()
     elif args.mode == "test-e2e":

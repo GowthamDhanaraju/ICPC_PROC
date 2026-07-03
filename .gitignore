@@ -1,15 +1,9 @@
 # Python Cache
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
 *.pyo
-*.pyd
-
-# Environments
-.venv/
-env/
-venv/
-ENV/
-
 # Database files
 *.db
 *.sqlite3
