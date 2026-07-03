@@ -29,6 +29,26 @@ class Settings(BaseSettings):
     # --- ML Model Toggle ---
     MOCK_ML_MODELS: bool = True  # Set to False on production server
 
+    # --- Model Backend Selection ---
+    # Face detection backend: "insightface" | "yolo" | "haar"
+    FACE_BACKEND: str = "insightface"
+    # Identity verification backend: "arcface" | "lbph"
+    IDENTITY_BACKEND: str = "arcface"
+    # Gaze/head pose backend: "6drepnet" | "mediapipe"
+    GAZE_BACKEND: str = "6drepnet"
+    # VAD backend: "silero" | "rms"
+    VAD_BACKEND: str = "silero"
+    # Diarization backend: "resemblyzer" | "pyannote"
+    DIARIZATION_BACKEND: str = "resemblyzer"
+    # Whisper model size: "tiny.en" | "base.en" | "small.en" | "medium.en"
+    WHISPER_MODEL_SIZE: str = "tiny.en"
+
+    # --- HuggingFace (optional, for pyannote diarization) ---
+    HUGGINGFACE_TOKEN: Optional[str] = None
+
+    # --- InsightFace GPU context (-1 = CPU) ---
+    INSIGHTFACE_CTX_ID: int = -1
+
     # --- Visual Detection Thresholds ---
     FACE_CONFIDENCE_THRESHOLD: float = 0.5
     GADGET_CONFIDENCE_THRESHOLD: float = 0.5

@@ -27,6 +27,26 @@ mediapipe==0.10.14
 onnxruntime==1.18.1
 imageio-ffmpeg==0.5.1
 
+# --- Face Detection & Identity (InsightFace SCRFD + ArcFace) ---
+# SCRFD achieves 92.8 mAP on WiderFace Hard; ArcFace 99.5% on LFW
+insightface>=0.7.3
+
+# --- Gaze / Head Pose (6DRepNet via PyTorch) ---
+# Also needed for Silero VAD torch backend
+torch>=2.0.0
+torchvision>=0.15.0
+
+# --- Audio Transcription (faster-whisper — 4× faster than openai-whisper) ---
+faster-whisper>=1.0.0
+
+# --- Speaker Diarization (resemblyzer GE2E — no HuggingFace token required) ---
+resemblyzer>=0.1.3
+soundfile>=0.12.1
+
+# --- Optional: pyannote speaker diarization (best accuracy, needs HF token) ---
+# Uncomment to enable DIARIZATION_BACKEND=pyannote
+# pyannote.audio>=3.1.0
+
 # --- Audio ---
 scipy==1.13.1
 
