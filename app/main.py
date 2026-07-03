@@ -64,10 +64,11 @@ def submit_session(payload: JobCreate, db: Session = Depends(get_db)):
     Inserts a job entry to database and queues it for background pipeline processing.
     """
     try:
-        # Check for idempotency: if job with same key exists, return it
+        # Check for idempotency: if active job with same key exists, return it
         existing = db.query(Job).filter(
             Job.source_video_s3_uri == payload.video_s3_uri,
-            Job.candidate_id == payload.candidate_id
+            Job.candidate_id == payload.candidate_id,
+            Job.status.in_(["QUEUED", "PROCESSING"])
         ).first()
         
         if existing:
