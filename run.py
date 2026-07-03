@@ -44,6 +44,25 @@ def run_api_server():
     """Runs the FastAPI server using Uvicorn."""
     uvicorn.run("app.main:app", host="127.0.0.1", port=8000, log_level="info")
 
+def wait_for_server(url: str = "http://127.0.0.1:8000/test/webhook-received", timeout: float = 60.0):
+    """
+    Waits for the background FastAPI server to open port 8000 and boot up.
+    """
+    import requests
+    print("Waiting for API server to boot up (loading ML frameworks)...")
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        try:
+            response = requests.get(url, timeout=1.0)
+            if response.status_code == 200:
+                print(f"API server booted successfully in {time.time() - start_time:.1f}s.")
+                return
+        except requests.exceptions.RequestException:
+            pass
+        time.sleep(1.0)
+    print("Error: API server failed to boot within timeout limit.")
+    sys.exit(1)
+
 def run_sqs_worker():
     """Runs a standalone worker listening to SQS events."""
     from app.orchestration.queue import SQSListener, global_queue
@@ -96,7 +115,7 @@ def run_e2e_test():
     server_thread.start()
     
     # Wait for server to boot
-    time.sleep(3.0)
+    wait_for_server()
     
     # Initialize client and submit job
     client = ProctoringClient("http://127.0.0.1:8000")
@@ -204,7 +223,7 @@ def run_gdrive_test(url: str, candidate_id: str):
     server_thread.start()
     
     # Wait for server to boot
-    time.sleep(3.0)
+    wait_for_server()
     
     # Initialize client and submit job
     client = ProctoringClient("http://127.0.0.1:8000")
