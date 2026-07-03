@@ -15,17 +15,15 @@ pydantic-settings==2.3.4
 # --- Database ---
 sqlalchemy==2.0.31
 alembic==1.13.2
-psycopg2-binary==2.9.9
 
 # --- Computer Vision ---
-opencv-python-headless==4.10.0.84
-numpy==1.26.4
-
+opencv-python-headless>=4.10.0
+numpy>=1.26.4
 # --- ML Frameworks (optional — set MOCK_ML_MODELS=True to skip) ---
-ultralytics==8.2.54
-mediapipe==0.10.14
-onnxruntime==1.18.1
-imageio-ffmpeg==0.5.1
+ultralytics>=8.2.54
+mediapipe>=0.10.30
+onnxruntime>=1.18.1
+imageio-ffmpeg>=0.5.1
 
 # --- Face Detection & Identity (InsightFace SCRFD + ArcFace) ---
 # SCRFD achieves 92.8 mAP on WiderFace Hard; ArcFace 99.5% on LFW

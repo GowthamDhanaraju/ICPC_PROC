@@ -159,8 +159,14 @@ def submit_session(payload: JobCreate, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(job)
 
-        global_queue.submit(job.id)
-        logger.info(f"Job {job.id} submitted for candidate {job.candidate_id}.")
+        # Dispatch job based on environment
+        if settings.ENV == "production" and settings.CELERY_BROKER_URL:
+            from app.orchestration.tasks import process_job_task
+            process_job_task.delay(job.id)
+            logger.info(f"Job {job.id} dispatched to Celery for candidate {job.candidate_id}.")
+        else:
+            global_queue.submit(job.id)
+            logger.info(f"Job {job.id} submitted to local thread queue for candidate {job.candidate_id}.")
 
         return JobSubmitResponse(job_id=job.id, status=job.status)
 

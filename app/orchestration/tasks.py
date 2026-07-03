@@ -48,22 +48,21 @@ celery_app.conf.update(
 # ---------------------------------------------------------------------------
 @celery_app.task(
     bind=True,
-    name="proctoring.process_job",
     max_retries=3,
-    default_retry_delay=30,        # 30 second initial retry delay
-    acks_late=True,
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_jitter=True,
 )
 def process_job_task(self, job_id: str):
     """
-    Celery task wrapper around the core `process_job` pipeline.
-    Handles transient exceptions with automatic retry + exponential backoff.
+    Celery task entrypoint for processing a video proctoring session.
+    Automatically retries on transient exceptions with exponential backoff.
     """
     from app.orchestration.worker import process_job
     try:
-        logger.info(f"Celery worker starting job: {job_id}")
+        logger.info(f"Celery worker started job {job_id}")
         process_job(job_id)
-        logger.info(f"Celery worker completed job: {job_id}")
+        logger.info(f"Celery worker completed job {job_id}")
     except Exception as exc:
-        logger.error(f"Job {job_id} failed on attempt {self.request.retries + 1}: {exc}")
-        # Exponential backoff: 30s, 60s, 120s
-        raise self.retry(exc=exc, countdown=30 * (2 ** self.request.retries))
+        logger.error(f"Celery worker failed job {job_id}: {exc}")
+        raise exc
