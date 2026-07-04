@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import argparse
@@ -10,6 +11,88 @@ import uvicorn
 from app.config import settings
 from app.database import init_db
 from app.sdk.client import ProctoringClient
+
+
+def _print_report_summary(report_path: str):
+    """
+    Reads a saved JSON report and prints a human-readable summary to stdout.
+    Exits gracefully if the file cannot be read.
+    """
+    if not report_path or not os.path.exists(report_path):
+        print(f"[WARNING] Report file not found: {report_path}")
+        return
+
+    with open(report_path, "r", encoding="utf-8") as f:
+        report = json.load(f)
+
+    meta = report.get("meta", {})
+    summary = report.get("summary", {})
+    events = report.get("events", {})
+
+    print("\n" + "=" * 60)
+    print(" PIPELINE DETECTION REPORT")
+    print("=" * 60)
+    print(f"  Job ID        : {meta.get('job_id', 'N/A')}")
+    print(f"  Candidate     : {meta.get('candidate_id', 'N/A')}")
+    print(f"  Video         : {meta.get('video_source', 'N/A')}")
+    print(f"  Duration      : {meta.get('video_duration_s', 'N/A')} s")
+    print(f"  Frames sampled: {meta.get('frames_sampled', 'N/A')}")
+    print(f"  Generated at  : {meta.get('generated_at', 'N/A')}")
+
+    # --- Face ---
+    fs = summary.get("face", {})
+    print("\n[ FACE DETECTION ]")
+    print(f"  Frames with no face      : {fs.get('frames_with_no_face', 0)}")
+    print(f"  Frames with one face     : {fs.get('frames_with_one_face', 0)}")
+    print(f"  Frames with multiple faces: {fs.get('frames_with_multiple_faces', 0)}")
+    print(f"  Max faces in one frame   : {fs.get('max_faces_in_single_frame', 0)}")
+
+    # --- Gaze ---
+    gs = summary.get("gaze", {})
+    print("\n[ GAZE / HEAD POSE ]")
+    print(f"  Frames with gaze data    : {gs.get('frames_with_gaze_data', 0)}")
+    print(f"  Frames looking away      : {gs.get('frames_looking_away', 0)}")
+
+    # --- Gadgets ---
+    gd = summary.get("gadget", {})
+    print("\n[ GADGET / OBJECT DETECTION ]")
+    print(f"  Frames with gadget       : {gd.get('frames_with_gadget_detected', 0)}")
+    classes = gd.get('unique_classes_detected', [])
+    print(f"  Device classes detected  : {', '.join(classes) if classes else 'None'}")
+
+    # --- Identity ---
+    ids = summary.get("identity", {})
+    print("\n[ IDENTITY VERIFICATION ]")
+    print(f"  Enrollment photo used    : {ids.get('enrollment_photo_provided', False)}")
+    print(f"  Frames checked           : {ids.get('frames_checked', 0)}")
+    print(f"  Frames flagged (mismatch): {ids.get('frames_flagged_as_mismatch', 0)}")
+
+    # --- Audio ---
+    aud = summary.get("audio", {})
+    print("\n[ AUDIO ANALYSIS ]")
+    if aud.get("available"):
+        print(f"  Total speech duration    : {aud.get('total_speech_s', 'N/A')} s")
+        print(f"  Distinct speakers        : {aud.get('distinct_speakers', 'N/A')}")
+        print(f"  Non-primary segments     : {aud.get('non_primary_segments', 0)}")
+    else:
+        print("  No audio track in video.")
+
+    # --- Events ---
+    print("\n[ DETECTED EVENT WINDOWS ]")
+    for etype, edata in events.items():
+        windows = edata.get("windows", [])
+        if windows:
+            print(f"  {etype} ({len(windows)} window(s)):")
+            for w in windows:
+                print(
+                    f"    {w['start_ts']:.1f}s → {w['end_ts']:.1f}s "
+                    f"| dur={w['duration_s']:.1f}s "
+                    f"| conf={w['avg_confidence']:.2f}"
+                )
+
+    print("\n" + "-" * 60)
+    print(f"  Full report saved to: {report_path}")
+    print("=" * 60 + "\n")
 
 def generate_dummy_video(path: str, duration_sec: float = 15.0, fps: float = 10.0):
     """
@@ -80,163 +163,76 @@ def run_sqs_worker():
         listener.stop()
         global_queue.stop()
 
-def run_e2e_test():
+def run_e2e_test(output_dir: str = "reports"):
     """
     Executes a complete local end-to-end integration flow:
     1. Generates a dummy MP4 video in a system temp directory.
     2. Spins up FastAPI server on a background thread.
     3. Uses ProctoringClient SDK to submit a job (local abs path as URI).
     4. Polls job status until completion.
-    5. Displays score and timeline violations.
+    5. Prints report summary and saves JSON report to output_dir.
     """
     print("=== STARTING END-TO-END PROCTORING PIPELINE TEST ===")
 
     settings.TESTING_MODE = True
     init_db()
-    
-    # Write the test video to a system temp dir (not ./storage/)
+
     test_temp_dir = tempfile.mkdtemp(prefix="proctoring_e2e_")
     local_video_path = os.path.join(test_temp_dir, "exam_video.mp4")
-    
+
     generate_dummy_video(local_video_path, duration_sec=120.0, fps=10.0)
-    
+
     server_thread = threading.Thread(target=run_api_server, daemon=True)
     server_thread.start()
     wait_for_server()
-    
+
     client = ProctoringClient("http://127.0.0.1:8000")
-    
-    # Submit the absolute local path directly — get_local_path() returns it as-is
-    # because os.path.exists() is True.  No MinIO download needed for tests.
     webhook_url = "http://127.0.0.1:8000/test/webhook-target"
-    
+
     print(f"Submitting job via Client SDK for {local_video_path}...")
     res = client.submit_session(
         candidate_id="candidate_123",
-        video_s3_uri=local_video_path,   # absolute path, passes schema validator
-        webhook_url=webhook_url
+        video_s3_uri=local_video_path,
+        webhook_url=webhook_url,
     )
     job_id = res["job_id"]
     print(f"Job submitted! Job ID: {job_id}")
-    
+
     print("Polling job status until execution completes...")
     try:
         final_result = client.poll_session_until_complete(job_id, interval=1.0, timeout=120.0)
-        print("\n=== PIPELINE EXECUTION COMPLETED ===")
-        print(f"Job Status: {final_result['status']}")
-        print(f"Overall Fairness Score: {final_result['overall_score']}/100")
-        print("\nDetected Violations Timeline:")
-        for v in final_result["violations"]:
-            print(f" - {v['type']}: {v['start_ts']} -> {v['end_ts']} ({v['duration']:.1f}s, Conf: {v['confidence']:.2f})")
-            if v['evidence_frame_s3_uri']:
-                print(f"   Evidence S3 URI: {v['evidence_frame_s3_uri']}")
-                
-        import requests
-        hooks_res = requests.get("http://127.0.0.1:8000/test/webhook-received")
+        print(f"\nJob Status: {final_result['status']}")
+
+        # Report is saved by the worker; show its path and summary
+        report_path = os.path.join(
+            os.path.abspath(output_dir), f"{job_id}.json"
+        )
+        _print_report_summary(report_path)
+
+        import requests as _req
+        hooks_res = _req.get("http://127.0.0.1:8000/test/webhook-received")
         if hooks_res.status_code == 200 and len(hooks_res.json()) > 0:
-            print("\n[SUCCESS] Webhook was dispatched and received successfully!")
-            print(f"Webhook Payload: {hooks_res.json()[-1]}")
+            print("[SUCCESS] Webhook was dispatched and received.")
         else:
-            print("\n[WARNING] Webhook was not received by the test endpoint.")
-            
+            print("[WARNING] Webhook was not received by the test endpoint.")
+
     except Exception as e:
-        print(f"E2E test failed with error: {e}")
+        print(f"E2E test failed: {e}")
         sys.exit(1)
     finally:
         import shutil
         shutil.rmtree(test_temp_dir, ignore_errors=True)
-        
+
     print("\n=== E2E TEST COMPLETED SUCCESSFULLY ===")
 
-import re
-import requests
 
-def parse_gdrive_id(url: str) -> str:
-    """Parses Google Drive share URL and extracts the file ID."""
-    match = re.search(r'/file/d/([a-zA-Z0-9_-]+)', url)
-    if match:
-        return match.group(1)
-    match = re.search(r'id=([a-zA-Z0-9_-]+)', url)
-    if match:
-        return match.group(1)
-    if re.match(r'^[a-zA-Z0-9_-]{25,}$', url):
-        return url
-    raise ValueError(f"Could not extract Google Drive File ID from: {url}")
 
-def download_gdrive_file(file_id: str, dest_path: str):
-    """Downloads a publicly accessible file from Google Drive using gdown."""
-    import gdown
-    url = f"https://drive.google.com/uc?id={file_id}"
-    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-    print(f"Connecting and downloading file ID: {file_id} via gdown...")
-    gdown.download(url, dest_path, quiet=False, use_cookies=False)
 
-def run_gdrive_test(url: str, candidate_id: str):
-    """Downloads a Google Drive video and runs the local proctoring pipeline on it."""
-    if not url:
-        print("Error: --url parameter is required when running test-gdrive mode.")
-        sys.exit(1)
-        
-    try:
-        file_id = parse_gdrive_id(url)
-    except Exception as e:
-        print(f"URL Parsing Error: {e}")
-        sys.exit(1)
-
-    # Download to a system temp dir
-    test_temp_dir = tempfile.mkdtemp(prefix=f"proctoring_gdrive_{file_id[:8]}_")
-    local_video_path = os.path.join(test_temp_dir, "video.mp4")
-    
-    if not os.path.exists(local_video_path):
-        try:
-            download_gdrive_file(file_id, local_video_path)
-        except Exception as e:
-            print(f"Failed to download Google Drive video: {e}")
-            sys.exit(1)
-    else:
-        print(f"Google Drive video already at: {local_video_path}")
-        
-    settings.TESTING_MODE = True
-    init_db()
-    
-    server_thread = threading.Thread(target=run_api_server, daemon=True)
-    server_thread.start()
-    wait_for_server()
-    
-    client = ProctoringClient("http://127.0.0.1:8000")
-    webhook_url = "http://127.0.0.1:8000/test/webhook-target"
-    
-    print(f"Submitting job via Client SDK for {local_video_path}...")
-    res = client.submit_session(
-        candidate_id=candidate_id,
-        video_s3_uri=local_video_path,
-        webhook_url=webhook_url
-    )
-    job_id = res["job_id"]
-    print(f"Job submitted! Job ID: {job_id}")
-    
-    print("Polling until pipeline completes...")
-    try:
-        final_result = client.poll_session_until_complete(job_id, interval=2.0, timeout=600.0)
-        print("\n=== PIPELINE EXECUTION COMPLETED ===")
-        print(f"Job Status: {final_result['status']}")
-        print(f"Overall Fairness Score: {final_result['overall_score']}/100")
-        print("\nDetected Violations Timeline:")
-        for v in final_result["violations"]:
-            print(f" - {v['type']}: {v['start_ts']} -> {v['end_ts']} ({v['duration']:.1f}s, Conf: {v['confidence']:.2f})")
-            if v['evidence_frame_s3_uri']:
-                print(f"   Evidence S3 URI: {v['evidence_frame_s3_uri']}")
-    except Exception as e:
-        print(f"Gdrive test run failed: {e}")
-        sys.exit(1)
-    finally:
-        import shutil
-        shutil.rmtree(test_temp_dir, ignore_errors=True)
-
-def run_local_test(video_path: str, candidate_id: str):
+def run_local_test(video_path: str, candidate_id: str, output_dir: str = "reports"):
     """
     Runs the proctoring pipeline directly on a local video file.
     No temp dir management needed — the file is already on disk.
+    The pipeline saves a JSON report to output_dir/<job_id>.json.
     """
     if not video_path:
         print("Error: --file parameter is required for test-local mode.")
@@ -249,8 +245,9 @@ def run_local_test(video_path: str, candidate_id: str):
 
     file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
     print(f"=== LOCAL FILE PROCTORING TEST ===")
-    print(f"Video: {video_path} ({file_size_mb:.1f} MB)")
-    print(f"Candidate: {candidate_id}")
+    print(f"Video     : {video_path} ({file_size_mb:.1f} MB)")
+    print(f"Candidate : {candidate_id}")
+    print(f"Output dir: {os.path.abspath(output_dir)}")
 
     settings.TESTING_MODE = True
     init_db()
@@ -265,8 +262,8 @@ def run_local_test(video_path: str, candidate_id: str):
     print(f"Submitting job for {video_path}...")
     res = client.submit_session(
         candidate_id=candidate_id,
-        video_s3_uri=video_path,   # absolute path passed directly
-        webhook_url=webhook_url
+        video_s3_uri=video_path,
+        webhook_url=webhook_url,
     )
     job_id = res["job_id"]
     print(f"Job submitted! ID: {job_id}")
@@ -274,28 +271,27 @@ def run_local_test(video_path: str, candidate_id: str):
     print("Polling until pipeline completes (this may take several minutes for long videos)...")
     try:
         final = client.poll_session_until_complete(job_id, interval=3.0, timeout=7200.0)
-        print("\n=== PIPELINE COMPLETED ===")
-        print(f"Job Status : {final['status']}")
-        print(f"Fairness Score: {final['overall_score']}/100")
-        print("\nViolation Timeline:")
-        for v in final["violations"]:
-            print(f"  [{v['type']}] {v['start_ts']} → {v['end_ts']} "
-                  f"({v['duration']:.1f}s, conf={v['confidence']:.2f})")
-            if v.get('evidence_frame_s3_uri'):
-                print(f"    Evidence: {v['evidence_frame_s3_uri']}")
-        if not final["violations"]:
-            print("  No violations detected.")
+        print(f"\nJob Status: {final['status']}")
+        report_path = os.path.join(os.path.abspath(output_dir), f"{job_id}.json")
+        _print_report_summary(report_path)
     except Exception as e:
         print(f"Test failed: {e}")
         sys.exit(1)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Proctoring Pipeline Control CLI")
-    parser.add_argument("mode", choices=["api", "worker", "test-e2e", "test-gdrive", "test-local"],
-                        help="Execution mode")
-    parser.add_argument("--url", help="Google Drive shared file URL (required for test-gdrive)")
+    parser.add_argument(
+        "mode",
+        choices=["api", "worker", "test-e2e", "test-local"],
+        help="Execution mode",
+    )
     parser.add_argument("--file", help="Local video file path (required for test-local)")
     parser.add_argument("--candidate", default="test_candidate", help="Candidate ID")
+    parser.add_argument(
+        "--output",
+        default="reports",
+        help="Directory where the JSON report will be saved (default: ./reports)",
+    )
     args = parser.parse_args()
 
     if args.mode == "api":
@@ -303,8 +299,6 @@ if __name__ == "__main__":
     elif args.mode == "worker":
         run_sqs_worker()
     elif args.mode == "test-e2e":
-        run_e2e_test()
-    elif args.mode == "test-gdrive":
-        run_gdrive_test(args.url, args.candidate)
+        run_e2e_test(output_dir=args.output)
     elif args.mode == "test-local":
-        run_local_test(args.file, args.candidate)
+        run_local_test(args.file, args.candidate, output_dir=args.output)
