@@ -40,8 +40,6 @@ class Settings(BaseSettings):
     VAD_BACKEND: str = "silero"
     # Diarization backend: "resemblyzer" | "pyannote"
     DIARIZATION_BACKEND: str = "resemblyzer"
-    # Whisper model size: "tiny.en" | "base.en" | "small.en" | "medium.en"
-    WHISPER_MODEL_SIZE: str = "tiny.en"
 
     # --- HuggingFace (optional, for pyannote diarization) ---
     HUGGINGFACE_TOKEN: Optional[str] = None

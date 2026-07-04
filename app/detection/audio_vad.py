@@ -7,11 +7,12 @@ Silero VAD benchmarks:
   - 97.4% F1 on RealWorld VAD vs ~82% for RMS threshold
   - Handles background noise, music, coughing, keyboard clicks without false triggers
   - <1ms per 30ms audio chunk (negligible overhead)
-  - Two backend modes:
+  - Three backend modes:
       1. torch  — full PyTorch model (recommended, most accurate)
       2. onnx   — ONNX Runtime only (lighter if torch is not installed)
       3. rms    — Energy threshold fallback (always available, lowest accuracy)
 
+Backend cascade: silero-torch → silero-onnx → rms
 Model auto-downloads (~2MB ONNX / ~5MB PyTorch) on first use.
 """
 import logging
@@ -234,21 +235,21 @@ def detect_voice_activity(wav_path: str) -> List[Tuple[float, float]]:
 
     backend = settings.VAD_BACKEND.lower()
 
-    # --- Silero (torch) ---
+    # --- Silero (torch) — try first when torch is available ---
     if backend == "silero" and _HAS_TORCH:
         try:
             return _run_silero_torch(data, sample_rate)
         except Exception as exc:
             logger.warning(f"Silero torch VAD failed: {exc}. Trying ONNX...")
 
-    # --- Silero (ONNX) ---
-    if backend in ("silero",) and _HAS_ONNX:
+    # --- Silero (ONNX) — fallback when torch is absent or fails ---
+    if backend == "silero" and _HAS_ONNX:
         try:
             return _run_silero_onnx(data, sample_rate)
         except Exception as exc:
             logger.warning(f"Silero ONNX VAD failed: {exc}. Falling back to RMS...")
 
-    # --- RMS fallback ---
+    # --- RMS threshold — always available ---
     try:
         return _run_rms_vad(data, sample_rate)
     except Exception as exc:

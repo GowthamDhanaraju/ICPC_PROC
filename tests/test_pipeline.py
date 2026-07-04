@@ -21,6 +21,7 @@ from app.database import init_db, Base, engine, SessionLocal, Job, Violation
 from app.preprocessing.media import calculate_motion_score, find_nearest_frame
 from app.scoring.aggregator import EventAggregator
 from app.scoring.scorer import ScoringEngine
+from app.detection.diarization import count_distinct_voices
 from app.main import app
 
 
@@ -68,6 +69,10 @@ def test_config():
     assert settings.ADAPTIVE_SAMPLING_BASELINE_INTERVAL == 1.6
     assert settings.GAZE_AWAY_YAW_THRESHOLD == 20.0
     assert settings.MOCK_ML_MODELS is True
+    # Whisper config should no longer exist
+    assert not hasattr(settings, "WHISPER_MODEL_SIZE"), (
+        "WHISPER_MODEL_SIZE should have been removed from config"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +104,39 @@ def test_find_nearest_frame_bisect():
 
     result_empty = find_nearest_frame([], 5.0)
     assert result_empty is None
+
+
+# ---------------------------------------------------------------------------
+# Voice Count Diarization Tests
+# ---------------------------------------------------------------------------
+
+def test_voice_count_mock_returns_two_speakers():
+    """In MOCK_ML_MODELS mode, count_distinct_voices should return 2 speakers."""
+    result = count_distinct_voices("/nonexistent.wav", [])
+    assert result["num_speakers"] == 2
+    assert "speaker_0" in result["speaker_segments"]
+    assert "speaker_1" in result["speaker_segments"]
+    assert len(result["flagged_segments"]) > 0
+    assert 0.0 < result["confidence"] <= 1.0
+
+
+def test_voice_count_mock_flagged_segments_are_non_primary():
+    """Flagged segments should not include segments from the primary speaker."""
+    result = count_distinct_voices("/nonexistent.wav", [])
+    primary_segs = result["speaker_segments"]["speaker_0"]
+    for seg in result["flagged_segments"]:
+        assert seg not in primary_segs, (
+            "A flagged segment should not belong to the primary speaker"
+        )
+
+
+def test_voice_count_result_keys():
+    """Result dict must always contain all required keys."""
+    result = count_distinct_voices("/nonexistent.wav", [])
+    assert "num_speakers" in result
+    assert "speaker_segments" in result
+    assert "flagged_segments" in result
+    assert "confidence" in result
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +175,23 @@ def test_aggregator_keeps_sustained_event():
     assert violations[0]["start_ts"] == 10.0
     assert violations[0]["end_ts"] == 12.0
     assert pytest.approx(violations[0]["confidence"]) == 0.85
+
+
+def test_aggregator_audio_violation_passes_through():
+    """Audio violations from diarization should pass through aggregator correctly."""
+    agg = EventAggregator()
+    audio_detections = [{
+        "type": "SECOND_VOICE_DETECTED",
+        "start_ts": 100.0,
+        "end_ts": 105.0,
+        "duration": 5.0,
+        "confidence": 0.88,
+        "num_speakers": 2,
+    }]
+    violations = agg.aggregate([], audio_detections)
+    assert len(violations) == 1
+    assert violations[0]["type"] == "SECOND_VOICE_DETECTED"
+    assert violations[0]["start_ts"] == 100.0
 
 
 # ---------------------------------------------------------------------------

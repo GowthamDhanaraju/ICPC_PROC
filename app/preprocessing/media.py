@@ -5,6 +5,9 @@ Key optimizations vs. original:
 - Frame sampling uses cap.grab() for sequential reads instead of
   cap.set(CAP_PROP_POS_MSEC) per frame. This avoids repeated H.264 keyframe
   decodes and is ~5-20x faster on long videos.
+- sample_video_frames() now implements TRUE adaptive sampling: the next
+  frame's interval is computed from the current frame's motion score,
+  building the target list dynamically rather than pre-freezing it.
 - sample_video_frames() returns a sorted list AND a timestamp-indexed dict
   for O(log N) evidence frame lookups in the worker.
 """
@@ -205,12 +208,16 @@ def sample_video_frames(
     video_path: str,
 ) -> Tuple[List[Tuple[float, np.ndarray]], Dict[float, np.ndarray]]:
     """
-    Performs adaptive frame sampling on the input video.
+    Performs TRUE adaptive frame sampling on the input video.
 
-    Optimization: Instead of seeking to each timestamp with cap.set() (which
-    forces an H.264 keyframe decode for every call), we read frames sequentially
-    using cap.grab() to skip frames cheaply, only calling cap.retrieve() when
-    we actually need the pixel data. This is 5-20x faster on long videos.
+    The sampling interval is updated after EVERY captured frame based on the
+    measured motion score, so dense/sparse adaptation actually takes effect.
+    (The previous implementation pre-froze a target list at baseline interval,
+    making the adaptive logic a dead code path.)
+
+    Optimization: We read frames sequentially with cap.grab() to skip cheaply,
+    calling cap.retrieve() only for frames we actually want. This is 5-20x
+    faster than repeated cap.set(CAP_PROP_POS_MSEC) on H.264-encoded videos.
 
     Returns:
         frames_list: Sorted list of (timestamp_seconds, frame_bgr) tuples.
@@ -233,22 +240,18 @@ def sample_video_frames(
     prev_frame: Optional[np.ndarray] = None
     current_interval = baseline
 
-    # Target timestamps we want to sample
-    target_times: List[float] = []
-    t = 0.0
-    while t < duration:
-        target_times.append(t)
-        t += current_interval  # initial pass uses baseline; adapted below
-
-    # --- Sequential read loop ---
-    # We'll compute target frame indices and walk through the video once.
-    target_frame_indices = sorted(set(int(round(t * fps)) for t in target_times))
-
+    # True adaptive loop: we decide the NEXT target dynamically after each capture
+    next_target_time = 0.0
     current_frame_idx = 0
-    for target_idx in target_frame_indices:
-        # Skip frames cheaply using grab()
-        while current_frame_idx < target_idx:
-            cap.grab()
+
+    while next_target_time < duration:
+        target_frame_idx = int(round(next_target_time * fps))
+        target_frame_idx = min(target_frame_idx, total_frames - 1)
+
+        # Skip to target frame cheaply using grab()
+        while current_frame_idx < target_frame_idx:
+            if not cap.grab():
+                break
             current_frame_idx += 1
 
         ret, frame = cap.read()
@@ -260,16 +263,18 @@ def sample_video_frames(
         frame_resized = _resize_to_long_edge(frame)
         frames_list.append((timestamp, frame_resized))
 
-        # Adapt next interval based on motion
+        # Adapt interval for the NEXT frame based on this frame's motion
         if prev_frame is not None:
             motion = calculate_motion_score(frame, prev_frame)
             if motion > thresh:
-                current_interval = dense
+                current_interval = dense    # High motion → sample more frequently
             elif motion < thresh * 0.2:
-                current_interval = sparse
+                current_interval = sparse   # Very static → sample less frequently
             else:
                 current_interval = baseline
         prev_frame = frame
+
+        next_target_time += current_interval
 
     cap.release()
 
@@ -278,7 +283,7 @@ def sample_video_frames(
 
     logger.info(
         f"Sampled {len(frames_list)} frames from {duration:.1f}s video "
-        f"({video_path}) using adaptive sequential read."
+        f"({video_path}) using true adaptive sequential read."
     )
     return frames_list, frames_dict
 

@@ -6,6 +6,8 @@ Optimizations vs. original:
 - Webhook dispatch is non-blocking (runs in a daemon thread).
 - Evidence frame lookup uses O(log N) binary search via find_nearest_frame().
 - All print() replaced with structured logging.
+- Whisper transcription removed: audio analysis now reports voice COUNT instead of text.
+- Audio violation confidence is derived from the clustering score, not hardcoded.
 """
 import logging
 import os
@@ -21,11 +23,10 @@ import requests
 from app.config import settings
 from app.database import SessionLocal, Job, Violation
 from app.detection.audio_vad import detect_voice_activity
-from app.detection.diarization import detect_multiple_speakers
+from app.detection.diarization import count_distinct_voices
 from app.detection.face import detect_faces, verify_identity
 from app.detection.gadget import detect_gadgets
 from app.detection.gaze import estimate_gaze
-from app.detection.whisper_transcription import transcribe_segment
 from app.preprocessing.media import (
     extract_audio,
     find_nearest_frame,
@@ -48,7 +49,7 @@ def process_job(job_id: str):
     Full proctoring pipeline:
       1. Fetch job & mark PROCESSING.
       2. Audio extraction + Video frame sampling — run concurrently.
-      3. Run VAD → Diarization → Whisper on audio.
+      3. Run VAD → Voice Count Diarization on audio.
       4. Run face / gaze / gadget detection on sampled frames.
       5. Aggregate events → calculate score.
       6. Extract evidence frames (O(log N) lookup) and persist violations.
@@ -87,27 +88,40 @@ def process_job(job_id: str):
                     frames_list, _ = fut.result()  # _ = frames_dict (unused here)
 
         # ----------------------------------------------------------------
-        # Step 3: Audio analysis
+        # Step 3: Audio analysis — VAD + Voice Count Diarization
         # ----------------------------------------------------------------
         audio_violations: List[Dict[str, Any]] = []
 
         if audio_wav_path and os.path.exists(audio_wav_path):
-            logger.info(f"Running VAD + Diarization on {audio_wav_path}")
+            logger.info(f"Running VAD + Voice Count Diarization on {audio_wav_path}")
             speech_segments = detect_voice_activity(audio_wav_path)
-            multi_speaker_segs = detect_multiple_speakers(audio_wav_path, speech_segments)
+            voice_result = count_distinct_voices(audio_wav_path, speech_segments)
 
-            for start, end in multi_speaker_segs:
-                transcript = transcribe_segment(audio_wav_path, start, end)
+            num_speakers = voice_result["num_speakers"]
+            flagged_segments = voice_result["flagged_segments"]
+            diarization_confidence = voice_result["confidence"]
+
+            if num_speakers > 1:
                 logger.info(
-                    f"Suspicious audio {start:.1f}s–{end:.1f}s: '{transcript}'"
+                    f"Voice analysis: {num_speakers} distinct speaker(s) detected. "
+                    f"{len(flagged_segments)} non-primary segment(s) flagged."
+                )
+
+            for start, end in flagged_segments:
+                logger.info(
+                    f"Non-primary voice at {start:.1f}s–{end:.1f}s "
+                    f"(total speakers in session: {num_speakers})"
                 )
                 audio_violations.append({
                     "type": "SECOND_VOICE_DETECTED",
                     "start_ts": start,
                     "end_ts": end,
                     "duration": end - start,
-                    "confidence": 0.88,
+                    "confidence": diarization_confidence,
+                    "num_speakers": num_speakers,
                 })
+        else:
+            logger.info("No audio track found — skipping audio analysis.")
 
         # ----------------------------------------------------------------
         # Step 4: Visual detection on sampled frames

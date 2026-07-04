@@ -54,8 +54,8 @@ class JobResponse(BaseModel):
     overall_score: Optional[float] = None
     webhook_url: Optional[str] = None
     error_message: Optional[str] = None
-    created_at: str
-    updated_at: str
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
     violations: List[ViolationResponse] = []
 
 
