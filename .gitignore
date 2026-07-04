@@ -1,16 +1,39 @@
 # Python Cache
-# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
 *.pyo
+
+# Virtual Environments
+.venv/
+venv/
+env/
+
+# Environment Variables
+.env
+
 # Database files
 *.db
 *.sqlite3
+*.db-shm
+*.db-wal
 
-# Ephemeral per-job temp dirs (should never be committed)
+# Model weights
+*.pt
+*.onnx
+
+# Ephemeral per-job temp dirs
 storage/
+reports/
+logs/
+
+# Testing
+.pytest_cache/
 
 # OS files
 .DS_Store
 Thumbs.db
+
+# IDEs
+.vscode/
+.idea/

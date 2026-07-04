@@ -177,9 +177,14 @@ def build_report(
     # ----------------------------------------------------------------
     gaze_timeline: List[Dict[str, Any]] = []
     gaze_away_flags: List[Tuple[float, float]] = []
+    direction_time = {"Left": 0.0, "Right": 0.0, "Straight": 0.0}
+    prev_ts = 0.0
 
     for fd in frame_detections:
         ts = fd["timestamp"]
+        dur = ts - prev_ts
+        prev_ts = ts
+        
         if not fd.get("faces"):
             continue  # no face → gaze not meaningful
 
@@ -198,6 +203,8 @@ def build_report(
             direction = "Right"
         else:
             direction = "Straight"
+            
+        direction_time[direction] += dur
 
         gaze_timeline.append({
             "timestamp_s": round(ts, 3),
@@ -214,6 +221,9 @@ def build_report(
     gaze_stats: Dict[str, Any] = {
         "frames_with_gaze_data": len(gaze_timeline),
         "frames_looking_away": sum(1 for e in gaze_timeline if e["looking_away"]),
+        "time_looking_straight_s": round(direction_time["Straight"], 2),
+        "time_looking_left_s": round(direction_time["Left"], 2),
+        "time_looking_right_s": round(direction_time["Right"], 2),
     }
 
     # ----------------------------------------------------------------

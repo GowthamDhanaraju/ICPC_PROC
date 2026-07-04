@@ -88,6 +88,23 @@ def _draw_detection(frame: np.ndarray, detection: Dict[str, Any]):
                 yaw = gaze.get("yaw", 0.0)
                 pitch = gaze.get("pitch", 0.0)
                 
+                # Draw Gaze Line projecting from center of face (approx eye level)
+                import math
+                center_x = (x1 + x2) // 2
+                center_y = int(y1 + (y2 - y1) * 0.4)
+                
+                length = 150.0
+                # In standard image coords, positive X is right, positive Y is down.
+                # Yaw > 0 is looking left from the subject's perspective (which is to the right in the image).
+                # Pitch > 0 is looking down (positive Y).
+                dx = int(-math.sin(yaw * math.pi / 180.0) * length)
+                dy = int(math.sin(pitch * math.pi / 180.0) * length)
+                
+                # Draw the arrowed line in red
+                cv2.arrowedLine(frame, (center_x, center_y), (center_x + dx, center_y + dy), (0, 0, 255), 4, tipLength=0.2)
+                # Draw a small dot at the origin (eyes)
+                cv2.circle(frame, (center_x, center_y), 4, (0, 255, 255), -1)
+                
                 if yaw > 10.0:
                     direction = "Left"
                 elif yaw < -10.0:
