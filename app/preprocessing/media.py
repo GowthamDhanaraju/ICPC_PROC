@@ -171,6 +171,62 @@ def upload_evidence_frame(job_id: str, timestamp: float, frame_data: bytes) -> O
         return None
 
 
+def upload_report(job_id: str, filename: str, report_json_str: str) -> Optional[str]:
+    """
+    Uploads the JSON report to MinIO/S3.
+    Returns the object URI, or None if no object storage is configured.
+    """
+    if not _is_object_storage_configured():
+        return None
+
+    s3_key = f"results/{job_id}/{filename}"
+    s3_uri = f"s3://{settings.RESULTS_S3_BUCKET}/{s3_key}"
+
+    try:
+        s3 = get_s3_client()
+        s3.put_object(
+            Bucket=settings.RESULTS_S3_BUCKET,
+            Key=s3_key,
+            Body=report_json_str.encode("utf-8"),
+            ContentType="application/json",
+        )
+        logger.info(f"JSON report uploaded → {s3_uri}")
+        return s3_uri
+    except Exception as exc:
+        logger.warning(f"JSON report upload failed for job {job_id}: {exc}")
+        return None
+
+
+def upload_overlay_video(job_id: str, filename: str, video_path: str) -> Optional[str]:
+    """
+    Uploads the generated overlay MP4 video to MinIO/S3.
+    Returns the object URI, or None if no object storage is configured or upload fails.
+    """
+    if not _is_object_storage_configured():
+        return None
+
+    if not os.path.exists(video_path):
+        logger.warning(f"Overlay video not found for upload: {video_path}")
+        return None
+
+    s3_key = f"results/{job_id}/{filename}"
+    s3_uri = f"s3://{settings.RESULTS_S3_BUCKET}/{s3_key}"
+
+    try:
+        s3 = get_s3_client()
+        s3.upload_file(
+            video_path,
+            settings.RESULTS_S3_BUCKET,
+            s3_key,
+            ExtraArgs={"ContentType": "video/mp4"}
+        )
+        logger.info(f"Overlay video uploaded → {s3_uri}")
+        return s3_uri
+    except Exception as exc:
+        logger.warning(f"Overlay video upload failed for job {job_id}: {exc}")
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Audio Extraction
 # ---------------------------------------------------------------------------
@@ -224,6 +280,71 @@ def extract_audio(
         return output_wav
     except Exception as exc:
         logger.warning(f"Exception during ffmpeg audio extraction: {exc}")
+        return None
+
+def slice_and_upload_audio(
+    audio_path: str,
+    start_ts: float,
+    end_ts: float,
+    job_id: str,
+    filename: str,
+    temp_dir: Optional[str] = None
+) -> Optional[str]:
+    """
+    Slices a portion of an audio WAV file using ffmpeg, then uploads it to MinIO.
+    Returns the uploaded S3 URI, or None on failure.
+    """
+    if not _is_object_storage_configured():
+        return None
+
+    if temp_dir:
+        os.makedirs(temp_dir, exist_ok=True)
+        slice_path = os.path.join(temp_dir, f"{filename}")
+    else:
+        fd, slice_path = tempfile.mkstemp(suffix=".wav", prefix=f"proctoring_slice_")
+        os.close(fd)
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path:
+        try:
+            import imageio_ffmpeg
+            ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+        except ImportError:
+            pass
+
+    if not ffmpeg_path:
+        logger.warning("ffmpeg not found — audio slicing skipped.")
+        return None
+
+    try:
+        # Slice audio: -ss start_time -to end_time
+        cmd = [
+            ffmpeg_path, "-y", 
+            "-i", audio_path,
+            "-ss", str(start_ts),
+            "-to", str(end_ts),
+            "-acodec", "copy",
+            slice_path
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            logger.warning(f"ffmpeg audio slicing failed: {result.stderr[-500:]}")
+            return None
+            
+        s3_key = f"results/{job_id}/{filename}"
+        s3_uri = f"s3://{settings.RESULTS_S3_BUCKET}/{s3_key}"
+        
+        s3 = get_s3_client()
+        s3.upload_file(
+            slice_path,
+            settings.RESULTS_S3_BUCKET,
+            s3_key,
+            ExtraArgs={"ContentType": "audio/wav"}
+        )
+        logger.info(f"Sliced audio segment uploaded → {s3_uri}")
+        return s3_uri
+    except Exception as exc:
+        logger.warning(f"Audio slicing/upload failed: {exc}")
         return None
 
 

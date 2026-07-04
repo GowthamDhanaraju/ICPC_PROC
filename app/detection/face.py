@@ -144,7 +144,12 @@ def detect_faces(frame: np.ndarray, timestamp: float = 0.0) -> List[Dict[str, An
                 return results
             except Exception as exc:
                 logger.warning(f"InsightFace inference failed at t={timestamp:.1f}s: {exc}")
-        logger.warning("InsightFace unavailable, falling back to YOLO.")
+        
+        global _WARNED_INSIGHTFACE
+        if not globals().get("_WARNED_INSIGHTFACE"):
+            logger.warning("InsightFace unavailable, falling back to YOLO.")
+            global _WARNED_INSIGHTFACE_SET
+            _WARNED_INSIGHTFACE = True
 
     # --- YOLOv8s-face ---
     if backend in ("insightface", "yolo"):

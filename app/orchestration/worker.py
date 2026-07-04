@@ -8,7 +8,9 @@ Changes from original:
   and saves it to reports/<job_id>.json.
 - Audio extraction and video frame sampling still run concurrently.
 - Webhook payload updated: contains report_path instead of score/violations.
+- Uploads the resulting JSON report to MinIO/S3.
 """
+import json
 import logging
 import os
 import shutil
@@ -16,6 +18,7 @@ import tempfile
 import threading
 import time
 import traceback
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
@@ -33,8 +36,11 @@ from app.preprocessing.media import (
     extract_audio,
     get_local_path,
     sample_video_frames,
+    upload_report,
+    upload_overlay_video,
 )
 from app.reporting.report import build_report, save_report
+from app.reporting.overlay import render_overlay_video
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +102,10 @@ def process_job(job_id: str):
         local_video_path = get_local_path(job.source_video_s3_uri, job_temp_dir)
         logger.info(f"Video resolved: {local_video_path}")
 
+        parsed_uri = urllib.parse.urlparse(job.source_video_s3_uri)
+        video_filename = os.path.basename(urllib.parse.unquote(parsed_uri.path))
+        video_basename = os.path.splitext(video_filename)[0] or job.id
+
         # Get video duration for report metadata
         duration_s = _video_duration(local_video_path)
 
@@ -133,6 +143,19 @@ def process_job(job_id: str):
                 f"Voice analysis: {num_speakers} distinct speaker(s) detected. "
                 f"{len(flagged_segments)} non-primary segment(s) flagged."
             )
+            
+            # Extract and upload secondary voice audio clips
+            from app.preprocessing.media import slice_and_upload_audio
+            for idx, (start_ts, end_ts) in enumerate(flagged_segments):
+                slice_filename = f"{video_basename}_secondary_voice_{idx+1}_{start_ts:.1f}s-{end_ts:.1f}s.wav"
+                slice_and_upload_audio(
+                    audio_path=audio_wav_path,
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    job_id=job.id,
+                    filename=slice_filename,
+                    temp_dir=job_temp_dir
+                )
         else:
             logger.info("No audio track found — skipping audio analysis.")
 
@@ -193,11 +216,29 @@ def process_job(job_id: str):
         )
 
         # ----------------------------------------------------------------
-        # Step 7: Save report to disk
+        # Step 7: Save report to disk and MinIO/S3
         # ----------------------------------------------------------------
         report_path = os.path.join(REPORTS_DIR, f"{job.id}.json")
         saved_path = save_report(report, report_path)
-        logger.info(f"Report saved → {saved_path}")
+        logger.info(f"Report saved locally → {saved_path}")
+
+        # Upload JSON report to MinIO / S3
+        report_filename = f"{video_basename}_result.json"
+        s3_uri = upload_report(job.id, report_filename, json.dumps(report, ensure_ascii=False))
+
+        final_report_path = s3_uri or saved_path
+
+        # ----------------------------------------------------------------
+        # Step 7.5: Generate & Upload Overlay Video (if enabled)
+        # ----------------------------------------------------------------
+        if settings.RENDER_OVERLAY_VIDEO:
+            logger.info("Overlay video rendering enabled. Generating MP4...")
+            overlay_path = os.path.join(job_temp_dir, f"overlay_{job.id}.mp4")
+            if render_overlay_video(frames_list, frame_detections, overlay_path):
+                overlay_filename = f"{video_basename}_result.mp4"
+                overlay_s3_uri = upload_overlay_video(job.id, overlay_filename, overlay_path)
+                if overlay_s3_uri:
+                    logger.info(f"Overlay video successfully uploaded to {overlay_s3_uri}")
 
         # ----------------------------------------------------------------
         # Step 8: Finalize job
@@ -206,12 +247,12 @@ def process_job(job_id: str):
         job.error_message = None
         # Store report path on the job if the column exists
         if hasattr(job, "report_path"):
-            job.report_path = saved_path
+            job.report_path = final_report_path
         db.commit()
         db.refresh(job)
-        logger.info(f"Job {job_id} COMPLETED. Report: {saved_path}")
+        logger.info(f"Job {job_id} COMPLETED. Report: {final_report_path}")
 
-        _dispatch_webhook_async(job, report_path=saved_path)
+        _dispatch_webhook_async(job, report_path=final_report_path)
 
     except Exception as exc:
         db.rollback()

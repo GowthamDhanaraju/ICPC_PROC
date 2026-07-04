@@ -78,6 +78,10 @@ class Settings(BaseSettings):
     # When True, /test/* routes are mounted (never enable in production)
     TESTING_MODE: bool = False
 
+    # --- Debug Features ---
+    # When True, generates an MP4 with bounding boxes/gaze lines and uploads it to MinIO
+    RENDER_OVERLAY_VIDEO: bool = False
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

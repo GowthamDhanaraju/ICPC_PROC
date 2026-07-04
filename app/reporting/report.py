@@ -192,11 +192,19 @@ def build_report(
             or abs(pitch) > settings.GAZE_AWAY_PITCH_THRESHOLD
         )
 
+        if yaw > 10.0:
+            direction = "Left"
+        elif yaw < -10.0:
+            direction = "Right"
+        else:
+            direction = "Straight"
+
         gaze_timeline.append({
             "timestamp_s": round(ts, 3),
             "yaw_deg": round(yaw, 2),
             "pitch_deg": round(pitch, 2),
             "roll_deg": round(roll, 2),
+            "direction": direction,
             "looking_away": away,
         })
 

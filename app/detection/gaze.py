@@ -45,12 +45,11 @@ _SIXD_MODEL = None
 _SIXD_LOCK = threading.Lock()
 _SIXD_TRANSFORM = None
 
-# Weights URL (official 6DRepNet checkpoint fine-tuned on 300W-LP + BIWI)
+# Weights URL (official 6DRepNet checkpoint fine-tuned)
 _SIXD_WEIGHTS_URL = (
-    "https://huggingface.co/spaces/osanseviero/6DRepNet/resolve/main/"
-    "model_weights/6DRepNet_300W_LP_BIWI.pth"
+    "https://huggingface.co/osanseviero/6DRepNet_300W_LP_AFLW2000/resolve/main/model.pth"
 )
-_SIXD_WEIGHTS_PATH = Path.home() / ".cache" / "proctoring" / "6DRepNet_300W_LP_BIWI.pth"
+_SIXD_WEIGHTS_PATH = Path.home() / ".cache" / "proctoring" / "6DRepNet_300W_LP_AFLW2000.pth"
 
 
 def _rotation_matrix_to_euler(R: np.ndarray) -> Dict[str, float]:
@@ -147,17 +146,21 @@ _LM_INDICES = [1, 152, 263, 33, 287, 57]
 
 
 def _get_face_mesh():
-    global _MP_FACE_MESH
+    global _MP_FACE_MESH, _HAS_MEDIAPIPE
     if not _HAS_MEDIAPIPE:
         return None
     if _MP_FACE_MESH is None:
         with _MP_LOCK:
             if _MP_FACE_MESH is None:
                 logger.info("Initializing MediaPipe FaceMesh (gaze fallback)...")
-                _MP_FACE_MESH = mp.solutions.face_mesh.FaceMesh(
-                    static_image_mode=True, max_num_faces=1,
-                    refine_landmarks=True, min_detection_confidence=0.5,
-                )
+                try:
+                    _MP_FACE_MESH = mp.solutions.face_mesh.FaceMesh(
+                        static_image_mode=True, max_num_faces=1,
+                        refine_landmarks=True, min_detection_confidence=0.5,
+                    )
+                except Exception as exc:
+                    logger.error(f"Failed to initialize MediaPipe FaceMesh: {exc}")
+                    _HAS_MEDIAPIPE = False
     return _MP_FACE_MESH
 
 
