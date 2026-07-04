@@ -95,10 +95,14 @@ def _draw_detection(frame: np.ndarray, detection: Dict[str, Any]):
                 
                 length = 150.0
                 # In standard image coords, positive X is right, positive Y is down.
-                # Yaw > 0 is looking left from the subject's perspective (which is to the right in the image).
-                # Pitch > 0 is looking down (positive Y).
-                dx = int(-math.sin(yaw * math.pi / 180.0) * length)
-                dy = int(math.sin(pitch * math.pi / 180.0) * length)
+                # Yaw > 0 is looking left from the subject's perspective -> Right in image (+X)
+                # Pitch > 0 is looking up from subject's perspective -> Up in image (-Y)
+                # We use cos(pitch) to foreshorten the X vector for a true 3D effect!
+                yaw_rad = yaw * math.pi / 180.0
+                pitch_rad = pitch * math.pi / 180.0
+                
+                dx = int(math.sin(yaw_rad) * math.cos(pitch_rad) * length)
+                dy = int(-math.sin(pitch_rad) * length)
                 
                 # Draw the arrowed line in red
                 cv2.arrowedLine(frame, (center_x, center_y), (center_x + dx, center_y + dy), (0, 0, 255), 4, tipLength=0.2)
