@@ -1,6 +1,6 @@
 # Batch Video Proctoring Pipeline (S3-sourced)
 
-A robust, high-throughput, S3-event-driven batch video proctoring pipeline. This application processes finished exam video recordings to output a timestamped list of proctoring violations and calculate an overall candidate fairness score.
+A robust, high-throughput, S3-event-driven batch video proctoring pipeline. This application processes finished exam video recordings to output a highly structured JSON observation log containing timestamped anomalies, audio slice clips, and a 3D-visualized video overlay.
 
 ---
 
@@ -8,62 +8,60 @@ A robust, high-throughput, S3-event-driven batch video proctoring pipeline. This
 
 ```
                     ┌─────────────────────────────┐
-  Host app writes   │  S3 bucket (incoming/ prefix)│
-  video directly ──▶│  (client's bucket, or yours) │
+  Host app writes   │  MinIO / S3 (incoming/)     │
+  video directly ──▶│  (client's bucket, or yours)│
                     └──────────────┬───────────────┘
                                    │ S3 Event Notification
                                    ▼
                     ┌─────────────────────────────┐
-                    │   SQS Queue (job messages)   │
+                    │   SQS Queue (job messages)  │
                     └──────────────┬───────────────┘
                                    ▼
                      ┌────────────────────────────────────┐
-                     │        Worker Pool (autoscaled)      │
-                     │  ┌───────────────┐  ┌─────────────┐ │
-                     │  │  Preprocessor │  │  Preprocessor│ │
-                     │  │ ffmpeg (range/ │  │  audio split │ │
-                     │  │  streamed read)│  │             │ │
-                     │  └───────┬───────┘  └──────┬──────┘ │
-                     │          ▼                  ▼        │
-                     │  ┌───────────────┐  ┌─────────────┐ │
-                     │  │ Visual detect │  │ Audio detect │ │
-                     │  │ (batched GPU) │  │  (CPU/GPU)   │ │
-                     │  └───────┬───────┘  └──────┬──────┘ │
-                     │          └────────┬─────────┘        │
-                     │                   ▼                  │
-                     │       Event Aggregator + Scorer       │
-                     └────────────────────┬───────────────────┘
-                                          ▼
-                    ┌────────────────────────────────────┐
-                    │  Results Store (Postgres / SQLite)   │
-                    │  + Evidence frames → S3 results/ prefix│
-                    └────────────────────┬───────────────────┘
+                     │        Worker Pool (autoscaled)    │
+                     │  ┌───────────────┐  ┌─────────────┐│
+                     │  │  Preprocessor │  │ Preprocessor││
+                     │  │ ffmpeg (video)│  │ audio split ││
+                     │  └───────┬───────┘  └──────┬──────┘│
+                     │          ▼                 ▼       │
+                     │  ┌───────────────┐  ┌─────────────┐│
+                     │  │ Visual detect │  │ Audio detect││
+                     │  │ (batched GPU) │  │  (CPU/GPU)  ││
+                     │  └───────┬───────┘  └──────┬──────┘│
+                     │          └────────┬────────┘       │
+                     │                   ▼                │
+                     │     Observation Report Builder     │
+                     │       (JSON + MP4 Overlay)         │
+                     └───────────────────┬────────────────┘
                                          ▼
-                         Webhook → Host App   (+ optional poll API)
+                    ┌────────────────────────────────────┐
+                    │ MinIO / S3 (results/ prefix)       │
+                    │ - `_result.json` (Full Data)       │
+                    │ - `_result.mp4` (Visuals)          │
+                    │ - `_secondary_voice.wav` (Audio)   │
+                    └────────────────────┬───────────────┘
+                                         ▼
+                         Webhook → Host App with JSON URL
 ```
 
 ### Key Processing Stages
 
-1. **Ingestion & Idempotency**: Jobs are triggered either by an **S3 Event Notification** landing in an SQS Queue, or explicitly via a REST API. Idempotency is enforced on the database layer via unique source video URIs to prevent double-processing.
+1. **Ingestion & Idempotency**: Jobs are triggered either by an **S3 Event Notification** landing in an SQS Queue, or explicitly via a REST API. 
 2. **Preprocessing**: 
    - Demuxes the video file into a WAV audio track (16kHz mono).
-   - Video frames are extracted via **Adaptive Sampling** (sampling densifies down to 0.4s during high motion/scene change, and sparsifies up to 4.0s during low motion).
+   - Video frames are extracted via **Adaptive Sampling**.
    - Extracted frames are downscaled to 640px long edge for fast visual inference.
 3. **Detection Modules**:
    - **Face count**: YOLOv8 face model counts faces (0 = absence, 2+ = collusion).
    - **Identity verification**: Cosine similarity check between ArcFace embeddings of detected face and enrollment photo.
-   - **Gaze / Head pose**: MediaPipe face landmarker calculates yaw/pitch rotation.
-   - **Gadget detection**: YOLOv8 detects prohibited items (phones, laptops, books, etc.).
+   - **Gaze / Head pose**: 6DRepNet calculates yaw/pitch rotation and tracks exact seconds spent looking Straight, Left, and Right.
+   - **Gadget detection**: YOLOv8 detects prohibited items (phones, laptops, books).
    - **Audio VAD**: Silero VAD detects human speech vs background noise.
-   - **Speaker diarization**: Pyannote speaker diarization flags multiple voices in speaker segments.
-   - **Whisper transcript**: Transcribes flagged diarized segments for suspicious keywords.
-4. **Aggregation & Debounce**:
-   - Smooths raw detections. A flag must persist for a minimum duration (debounce) to count as a violation.
-   - Merges consecutive violations of the same type within a specific time window.
-5. **Scoring Engine**:
-   - Computes a candidate fairness score starting from 100.
-   - Subtracts weighted severity penalties with a **diminishing marginal penalty** (geometric decay for count-based flags, sub-linear square root scaling for duration-based flags).
-6. **Delivery**: Writes results to database, uploads violation evidence frames, and delivers webhook notifications to the host app with exponential backoff.
+   - **Speaker diarization**: Resemblyzer speaker diarization flags multiple distinct voices.
+4. **Data Extraction & Delivery**:
+   - **Gaze 3D Overlay**: Renders a 3D-projected red arrow directly out of the candidate's face on the output MP4 to easily visualize their exact head pose.
+   - **Audio Slicing**: Uses `ffmpeg` to precisely slice out any flagged secondary voices as standalone `.wav` clips for auditing.
+   - **JSON Reporting**: Aggregates all anomalies into a structured JSON observation log (`_result.json`), uploads it to MinIO, and fires a Webhook to the host app.
 
 ---
 
@@ -82,19 +80,18 @@ A robust, high-throughput, S3-event-driven batch video proctoring pipeline. This
 │   │   └── worker.py          # Main job pipeline orchestration
 │   ├── preprocessing/
 │   │   ├── __init__.py
-│   │   └── media.py           # Video frame sampling & audio split
+│   │   └── media.py           # Video frame sampling, Audio Slicing, MinIO I/O
 │   ├── detection/
 │   │   ├── __init__.py
 │   │   ├── face.py            # Face detection & identity matching
-│   │   ├── gaze.py            # Gaze/head pose tracking
-│   │   ├── gadget.py          # Prohibited item checks
+│   │   ├── gaze.py            # Gaze/head pose tracking (6DRepNet)
+│   │   ├── gadget.py          # Prohibited item checks (YOLO)
 │   │   ├── audio_vad.py       # Speech/silence detection
-│   │   ├── diarization.py     # Second voice presence
-│   │   └── whisper_transcription.py
-│   ├── scoring/
+│   │   └── diarization.py     # Second voice presence (Resemblyzer)
+│   ├── reporting/
 │   │   ├── __init__.py
-│   │   ├── aggregator.py      # Timeline debounce & merge rules
-│   │   └── scorer.py          # Weighted severity scoring engine
+│   │   ├── report.py          # JSON log builder & time aggregation
+│   │   └── overlay.py         # 3D Gaze line and bounding box video renderer
 │   └── sdk/
 │       ├── __init__.py
 │       └── client.py          # SDK wrapper client
@@ -123,22 +120,22 @@ pip install -r requirements.txt
 
 ### Configuration (.env)
 
-Create a `.env` file in the root directory to customize parameters (defaults are stored in [app/config.py](file:///d:/ICPC_PROC/app/config.py)):
+Create a `.env` file in the root directory to customize parameters (defaults are stored in `app/config.py`):
 
 ```env
 DATABASE_URL=sqlite:///./proctoring.db
 MOCK_ML_MODELS=true # Set to false to run actual PyTorch/ONNX models
-AWS_ACCESS_KEY_ID=your_key
-AWS_SECRET_ACCESS_KEY=your_secret
-AWS_REGION=us-east-1
-SQS_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/123456789012/proctoring-queue
+MINIO_ENDPOINT=127.0.0.1:9000
+MINIO_ACCESS_KEY=your_key
+MINIO_SECRET_KEY=your_secret
+MINIO_BUCKET_NAME=proctortest
 ```
 
 ---
 
 ## 4. Run Scripts
 
-The project provides a unified entry point, [run.py](file:///d:/ICPC_PROC/run.py), to easily run the system.
+The project provides a unified entry point, `run.py`, to easily run the system.
 
 ### A. Run API Server (Including Background Workers)
 This launches the FastAPI server and starts background worker threads to automatically pick up submitted sessions.
@@ -148,15 +145,9 @@ python run.py api
 Access Swagger UI documentation at `http://127.0.0.1:8000/docs`.
 
 ### B. Run Standalone SQS Worker Fleet
-Launches the worker queue processing engine and subscribes directly to SQS messages (triggered by S3 bucket events).
+Launches the worker queue processing engine and subscribes directly to SQS messages (triggered by MinIO/S3 events).
 ```bash
 python run.py worker
-```
-
-### C. Run Local End-to-End Test Simulation
-This generates a mock video, starts the API server in a background thread, submits a job using the Client SDK, processes it through the pipeline, receives the webhook callback on a test receiver endpoint, and displays the score details and timeline violations.
-```bash
-python run.py test-e2e
 ```
 
 ---
@@ -174,8 +165,8 @@ client = ProctoringClient(base_url="http://localhost:8000")
 # Submit a job
 response = client.submit_session(
     candidate_id="candidate_abc_123",
-    video_s3_uri="s3://exam-bucket/recordings/exam_123.mp4",
-    enrollment_photo_s3_uri="s3://exam-bucket/enrollments/candidate_abc_123.jpg",
+    video_s3_uri="s3://proctortest/exam_123.mp4",
+    enrollment_photo_s3_uri="s3://proctortest/enrollments/candidate_abc_123.jpg",
     webhook_url="https://hostapp.com/api/proctoring-webhook"
 )
 
@@ -184,6 +175,6 @@ print(f"Submitted proctoring job. ID: {job_id}")
 
 # Wait for completion (optional polling)
 result = client.poll_session_until_complete(job_id, interval=2.0, timeout=180.0)
-print(f"Fairness score: {result['overall_score']}")
-print(f"Violations timeline: {result['violations']}")
+print(f"Job Status: {result['status']}")
+print(f"Final Report Location: {result['report_path']}")
 ```
