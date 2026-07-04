@@ -187,10 +187,14 @@ def verify_identity(
     face_crop: np.ndarray,
     enrollment_photo_uri: str,
     candidate_id: str,
+    temp_dir: Optional[str] = None,
 ) -> float:
     """
     Compares a live face crop against an enrollment photo.
     Returns cosine similarity in [0.0, 1.0]. Higher = more similar.
+
+    temp_dir — when provided, the enrollment photo is downloaded there and
+    reused on subsequent calls within the same job (per-job download cache).
 
     Backend cascade: arcface (insightface) → lbph (opencv)
     """
@@ -205,7 +209,7 @@ def verify_identity(
         if app is not None:
             try:
                 from app.preprocessing.media import get_local_path
-                enrollment_path = get_local_path(enrollment_photo_uri)
+                enrollment_path = get_local_path(enrollment_photo_uri, temp_dir)
                 enrollment_img = cv2.imread(enrollment_path)
                 if enrollment_img is None:
                     raise FileNotFoundError(f"Enrollment photo not readable: {enrollment_path}")

@@ -1,28 +1,28 @@
 """
-Video preprocessing and S3 storage utilities.
+Video preprocessing and MinIO/S3 storage utilities.
 
-Key optimizations vs. original:
-- Frame sampling uses cap.grab() for sequential reads instead of
-  cap.set(CAP_PROP_POS_MSEC) per frame. This avoids repeated H.264 keyframe
-  decodes and is ~5-20x faster on long videos.
-- sample_video_frames() now implements TRUE adaptive sampling: the next
-  frame's interval is computed from the current frame's motion score,
-  building the target list dynamically rather than pre-freezing it.
-- sample_video_frames() returns a sorted list AND a timestamp-indexed dict
-  for O(log N) evidence frame lookups in the worker.
+Storage model:
+- ALL persistent artifacts (evidence frames, audio downloads) go to MinIO/S3.
+- No files are written to local disk permanently.
+- Temp files are created in a per-job temp directory and cleaned up by the
+  worker after each job completes (success or failure).
+
+MinIO is boto3-compatible: set MINIO_ENDPOINT (host:port) in .env and boto3
+will use it instead of AWS S3.  AWS credentials (MINIO_ACCESS_KEY /
+MINIO_SECRET_KEY) are passed through the standard boto3 mechanism.
 """
 import bisect
 import logging
 import os
 import shutil
 import subprocess
+import tempfile
 import urllib.parse
 from typing import Dict, List, Optional, Tuple
 
 import boto3
 import cv2
 import numpy as np
-from botocore.exceptions import NoCredentialsError
 
 from app.config import settings
 
@@ -30,55 +30,97 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# S3 Helpers
+# S3 / MinIO Client
 # ---------------------------------------------------------------------------
 
 def get_s3_client():
     """
-    Builds a boto3 S3 client.
-    Uses explicit credentials from settings if provided;
-    falls back to IAM role / ~/.aws credentials otherwise.
+    Returns a boto3 S3 client pointing at MinIO (if MINIO_ENDPOINT is set)
+    or AWS S3 (otherwise).  Credentials fall back to IAM role / ~/.aws config
+    when neither MINIO nor explicit AWS keys are configured.
     """
-    kwargs = {"region_name": settings.AWS_REGION}
-    if settings.AWS_ACCESS_KEY_ID:
-        kwargs["aws_access_key_id"] = settings.AWS_ACCESS_KEY_ID
-    if settings.AWS_SECRET_ACCESS_KEY:
-        kwargs["aws_secret_access_key"] = settings.AWS_SECRET_ACCESS_KEY
+    kwargs: Dict = {}
+
+    if settings.MINIO_ENDPOINT:
+        # MinIO: always use path-style addressing (virtual-hosted style is default on AWS)
+        scheme = "https" if settings.MINIO_USE_SSL else "http"
+        kwargs["endpoint_url"] = f"{scheme}://{settings.MINIO_ENDPOINT}"
+        kwargs["config"] = boto3.session.Config(signature_version="s3v4")
+        if settings.MINIO_ACCESS_KEY:
+            kwargs["aws_access_key_id"] = settings.MINIO_ACCESS_KEY
+        if settings.MINIO_SECRET_KEY:
+            kwargs["aws_secret_access_key"] = settings.MINIO_SECRET_KEY
+        # MinIO doesn't use AWS regions but boto3 requires a value
+        kwargs["region_name"] = "us-east-1"
+    else:
+        # AWS S3
+        kwargs["region_name"] = settings.AWS_REGION
+        if settings.AWS_ACCESS_KEY_ID:
+            kwargs["aws_access_key_id"] = settings.AWS_ACCESS_KEY_ID
+        if settings.AWS_SECRET_ACCESS_KEY:
+            kwargs["aws_secret_access_key"] = settings.AWS_SECRET_ACCESS_KEY
+
     return boto3.client("s3", **kwargs)
 
 
-def _has_aws_credentials() -> bool:
-    """Returns True if any AWS credential source is configured."""
+def _is_object_storage_configured() -> bool:
+    """
+    Returns True when object storage (MinIO or AWS S3) is reachable.
+    Used to decide whether to attempt uploads.
+    """
     return (
-        settings.AWS_ACCESS_KEY_ID is not None
+        settings.MINIO_ENDPOINT is not None
+        or settings.AWS_ACCESS_KEY_ID is not None
         or os.getenv("AWS_ACCESS_KEY_ID") is not None
         or os.path.exists(os.path.expanduser("~/.aws/credentials"))
         or os.path.exists(os.path.expanduser("~/.aws/config"))
     )
 
 
-def get_local_path(s3_uri: str) -> str:
+# ---------------------------------------------------------------------------
+# Object Storage Helpers
+# ---------------------------------------------------------------------------
+
+def get_local_path(s3_uri: str, temp_dir: Optional[str] = None) -> str:
     """
-    Resolves an S3 URI to a local filesystem path:
-    1. If it's already a valid local path, return it as-is.
-    2. If a cached download exists, return the cache.
-    3. Attempt S3 download via boto3.
-    4. If no credentials exist, fall back to local mock storage.
+    Resolves an S3/MinIO URI to a local filesystem path for processing.
+
+    - If the URI is already a local path that exists, returns it as-is (no copy).
+    - Otherwise downloads the object to a temp file inside `temp_dir`
+      (or a system temp file if temp_dir is None).
+
+    Within a job's temp_dir the same filename is reused on repeated calls
+    (natural download cache), so the enrollment photo is only fetched once
+    per job regardless of how many frames call verify_identity().
+
+    **Caller must NOT delete files returned for pre-existing local paths.**
+    All files placed inside temp_dir are cleaned up by the worker's finally block.
     """
+    # Already a local path — return directly without copying
     if os.path.exists(s3_uri):
         return s3_uri
 
     parsed = urllib.parse.urlparse(s3_uri)
     if parsed.scheme != "s3":
+        # Treat as a literal path (might not exist — let the caller handle the error)
         return s3_uri
 
     bucket = parsed.netloc
     key = parsed.path.lstrip("/")
-    download_path = os.path.join(settings.LOCAL_STORAGE_DIR, "downloads", bucket, key)
-    os.makedirs(os.path.dirname(download_path), exist_ok=True)
 
-    if os.path.exists(download_path):
-        return download_path
+    # Determine where to download
+    if temp_dir:
+        os.makedirs(temp_dir, exist_ok=True)
+        filename = os.path.basename(key) or "download"
+        download_path = os.path.join(temp_dir, filename)
+        # Reuse within the same job temp dir (acts as a per-job download cache)
+        if os.path.exists(download_path):
+            logger.debug(f"Reusing cached download: {download_path}")
+            return download_path
+    else:
+        suffix = os.path.splitext(key)[1] or ""
+        fd, download_path = tempfile.mkstemp(suffix=suffix, prefix="proctoring_dl_")
+        os.close(fd)
 
     try:
         s3 = get_s3_client()
@@ -86,71 +128,75 @@ def get_local_path(s3_uri: str) -> str:
         s3.download_file(bucket, key, download_path)
         return download_path
     except Exception as exc:
-        logger.warning(f"S3 download failed for {s3_uri}: {exc}")
-        if _has_aws_credentials():
-            raise
-
-    # Offline fallback: check local storage mock directory
-    local_mock = os.path.join(settings.LOCAL_STORAGE_DIR, bucket, key)
-    if os.path.exists(local_mock):
-        logger.info(f"Using local storage fallback: {local_mock}")
-        return local_mock
-
-    raise FileNotFoundError(
-        f"S3 file {s3_uri} could not be retrieved and no local fallback exists."
-    )
+        # Clean up the empty temp file we created
+        if os.path.exists(download_path) and not (temp_dir and os.path.dirname(download_path) == temp_dir):
+            try:
+                os.unlink(download_path)
+            except OSError:
+                pass
+        raise FileNotFoundError(
+            f"Could not retrieve {s3_uri} from object storage: {exc}"
+        ) from exc
 
 
-def upload_evidence_frame(job_id: str, timestamp: float, frame_data: bytes) -> str:
+def upload_evidence_frame(job_id: str, timestamp: float, frame_data: bytes) -> Optional[str]:
     """
-    Saves an evidence frame JPEG locally and uploads it to the results S3 bucket.
-    Returns the S3 URI regardless of whether the upload succeeded
-    (on credential failure, the local file is kept and the URI is returned for the DB record).
+    Uploads an evidence frame JPEG directly to MinIO/S3.
+    Returns the object URI, or None if no object storage is configured.
+    No local file is written.
     """
+    if not _is_object_storage_configured():
+        logger.warning(
+            "No object storage configured (set MINIO_ENDPOINT or AWS credentials). "
+            "Evidence frame not stored."
+        )
+        return None
+
     filename = f"evidence_{job_id}_{int(timestamp * 1000)}.jpg"
     s3_key = f"results/{job_id}/{filename}"
     s3_uri = f"s3://{settings.RESULTS_S3_BUCKET}/{s3_key}"
 
-    # Always persist locally
-    local_path = os.path.join(
-        settings.LOCAL_STORAGE_DIR, settings.RESULTS_S3_BUCKET, job_id, filename
-    )
-    os.makedirs(os.path.dirname(local_path), exist_ok=True)
-    with open(local_path, "wb") as f:
-        f.write(frame_data)
-
     try:
         s3 = get_s3_client()
-        logger.info(f"Uploading evidence frame → {s3_uri}")
         s3.put_object(
             Bucket=settings.RESULTS_S3_BUCKET,
             Key=s3_key,
             Body=frame_data,
             ContentType="image/jpeg",
         )
+        logger.info(f"Evidence frame uploaded → {s3_uri}")
+        return s3_uri
     except Exception as exc:
-        logger.warning(f"S3 upload failed for {s3_uri}: {exc}")
-        if _has_aws_credentials():
-            raise
-
-    return s3_uri
+        logger.warning(f"Evidence frame upload failed for job {job_id} at {timestamp:.1f}s: {exc}")
+        return None
 
 
 # ---------------------------------------------------------------------------
 # Audio Extraction
 # ---------------------------------------------------------------------------
 
-def extract_audio(video_path: str, job_id: str) -> Optional[str]:
+def extract_audio(
+    video_path: str,
+    job_id: str,
+    temp_dir: Optional[str] = None,
+) -> Optional[str]:
     """
-    Extracts audio track from the video as mono 16kHz WAV via ffmpeg.
-    Returns the local WAV path, or None if ffmpeg is not found or extraction fails.
-    """
-    output_dir = os.path.join(settings.LOCAL_STORAGE_DIR, "audio", job_id)
-    os.makedirs(output_dir, exist_ok=True)
-    output_wav = os.path.join(output_dir, "audio.wav")
+    Extracts audio from the video as a mono 16 kHz WAV using ffmpeg.
 
-    if os.path.exists(output_wav):
-        return output_wav
+    The WAV is written to a temp file inside `temp_dir` (or a system temp file
+    if temp_dir is None).  The worker's finally block cleans up temp_dir.
+
+    Returns the temp WAV path, or None if ffmpeg is unavailable.
+    """
+    if temp_dir:
+        os.makedirs(temp_dir, exist_ok=True)
+        output_wav = os.path.join(temp_dir, "audio.wav")
+        # Reuse if already extracted in this job's temp dir
+        if os.path.exists(output_wav):
+            return output_wav
+    else:
+        fd, output_wav = tempfile.mkstemp(suffix=".wav", prefix=f"proctoring_{job_id[:8]}_")
+        os.close(fd)
 
     ffmpeg_path = shutil.which("ffmpeg")
     if not ffmpeg_path:
@@ -212,16 +258,12 @@ def sample_video_frames(
 
     The sampling interval is updated after EVERY captured frame based on the
     measured motion score, so dense/sparse adaptation actually takes effect.
-    (The previous implementation pre-froze a target list at baseline interval,
-    making the adaptive logic a dead code path.)
 
-    Optimization: We read frames sequentially with cap.grab() to skip cheaply,
-    calling cap.retrieve() only for frames we actually want. This is 5-20x
-    faster than repeated cap.set(CAP_PROP_POS_MSEC) on H.264-encoded videos.
+    Uses cap.grab() for sequential seeks — 5-20x faster than cap.set() on H.264.
 
     Returns:
         frames_list: Sorted list of (timestamp_seconds, frame_bgr) tuples.
-        frames_dict: Dict mapping timestamp → frame for O(1) lookups.
+        frames_dict: Dict mapping timestamp → frame for O(log N) evidence lookups.
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -240,15 +282,12 @@ def sample_video_frames(
     prev_frame: Optional[np.ndarray] = None
     current_interval = baseline
 
-    # True adaptive loop: we decide the NEXT target dynamically after each capture
     next_target_time = 0.0
     current_frame_idx = 0
 
     while next_target_time < duration:
-        target_frame_idx = int(round(next_target_time * fps))
-        target_frame_idx = min(target_frame_idx, total_frames - 1)
+        target_frame_idx = min(int(round(next_target_time * fps)), total_frames - 1)
 
-        # Skip to target frame cheaply using grab()
         while current_frame_idx < target_frame_idx:
             if not cap.grab():
                 break
@@ -263,13 +302,12 @@ def sample_video_frames(
         frame_resized = _resize_to_long_edge(frame)
         frames_list.append((timestamp, frame_resized))
 
-        # Adapt interval for the NEXT frame based on this frame's motion
         if prev_frame is not None:
             motion = calculate_motion_score(frame, prev_frame)
             if motion > thresh:
-                current_interval = dense    # High motion → sample more frequently
+                current_interval = dense
             elif motion < thresh * 0.2:
-                current_interval = sparse   # Very static → sample less frequently
+                current_interval = sparse
             else:
                 current_interval = baseline
         prev_frame = frame
@@ -278,12 +316,11 @@ def sample_video_frames(
 
     cap.release()
 
-    # Build timestamp-keyed dict for O(log N) evidence frame lookup
     frames_dict: Dict[float, np.ndarray] = {ts: fr for ts, fr in frames_list}
 
     logger.info(
         f"Sampled {len(frames_list)} frames from {duration:.1f}s video "
-        f"({video_path}) using true adaptive sequential read."
+        f"({video_path}) using adaptive sequential read."
     )
     return frames_list, frames_dict
 
@@ -294,7 +331,7 @@ def find_nearest_frame(
 ) -> Optional[np.ndarray]:
     """
     Finds the sampled frame whose timestamp is closest to `target_ts`
-    using binary search — O(log N) instead of O(N).
+    using binary search — O(log N).
     """
     if not frames_list:
         return None
@@ -304,7 +341,6 @@ def find_nearest_frame(
         return frames_list[0][1]
     if idx >= len(timestamps):
         return frames_list[-1][1]
-    # Pick whichever neighbour is closer
     before = frames_list[idx - 1]
     after  = frames_list[idx]
     return before[1] if abs(before[0] - target_ts) <= abs(after[0] - target_ts) else after[1]

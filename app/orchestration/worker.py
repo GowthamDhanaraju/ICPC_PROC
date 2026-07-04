@@ -8,14 +8,17 @@ Optimizations vs. original:
 - All print() replaced with structured logging.
 - Whisper transcription removed: audio analysis now reports voice COUNT instead of text.
 - Audio violation confidence is derived from the clustering score, not hardcoded.
+- All storage is MinIO/S3 — per-job temp dirs are created and cleaned up automatically.
 """
 import logging
 import os
+import shutil
+import tempfile
 import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import cv2
 import requests
@@ -48,12 +51,14 @@ def process_job(job_id: str):
     """
     Full proctoring pipeline:
       1. Fetch job & mark PROCESSING.
-      2. Audio extraction + Video frame sampling — run concurrently.
-      3. Run VAD → Voice Count Diarization on audio.
-      4. Run face / gaze / gadget detection on sampled frames.
-      5. Aggregate events → calculate score.
-      6. Extract evidence frames (O(log N) lookup) and persist violations.
-      7. Commit results, fire webhook asynchronously.
+      2. Create a per-job temp directory for all ephemeral files.
+      3. Audio extraction + Video frame sampling — run concurrently.
+      4. Run VAD → Voice Count Diarization on audio.
+      5. Run face / gaze / gadget detection on sampled frames.
+      6. Aggregate events → calculate score.
+      7. Upload evidence frames to MinIO/S3 (O(log N) lookup).
+      8. Commit results, fire webhook asynchronously.
+      9. Clean up the per-job temp directory (always runs, even on failure).
     """
     db = SessionLocal()
     job = db.query(Job).filter(Job.id == job_id).first()
@@ -67,28 +72,33 @@ def process_job(job_id: str):
     db.refresh(job)
     logger.info(f"Job {job_id} → PROCESSING")
 
+    # Create a job-scoped temp directory — ALL ephemeral files go here.
+    # Cleaned up unconditionally in the finally block below.
+    job_temp_dir = tempfile.mkdtemp(prefix=f"proctoring_{job_id[:8]}_")
+    logger.debug(f"Job temp dir: {job_temp_dir}")
+
     try:
-        local_video_path = get_local_path(job.source_video_s3_uri)
+        local_video_path = get_local_path(job.source_video_s3_uri, job_temp_dir)
         logger.info(f"Video resolved: {local_video_path}")
 
         # ----------------------------------------------------------------
-        # Step 2: Concurrently extract audio + sample video frames
+        # Step 3: Concurrently extract audio + sample video frames
         # ----------------------------------------------------------------
-        frames_list = []
-        audio_wav_path = None
+        frames_list: List = []
+        audio_wav_path: Optional[str] = None
 
         with ThreadPoolExecutor(max_workers=2) as pool:
-            future_audio = pool.submit(extract_audio, local_video_path, job.id)
+            future_audio = pool.submit(extract_audio, local_video_path, job.id, job_temp_dir)
             future_video = pool.submit(sample_video_frames, local_video_path)
 
             for fut in as_completed([future_audio, future_video]):
                 if fut is future_audio:
                     audio_wav_path = fut.result()
                 else:
-                    frames_list, _ = fut.result()  # _ = frames_dict (unused here)
+                    frames_list, _ = fut.result()
 
         # ----------------------------------------------------------------
-        # Step 3: Audio analysis — VAD + Voice Count Diarization
+        # Step 4: Audio analysis — VAD + Voice Count Diarization
         # ----------------------------------------------------------------
         audio_violations: List[Dict[str, Any]] = []
 
@@ -97,7 +107,7 @@ def process_job(job_id: str):
             speech_segments = detect_voice_activity(audio_wav_path)
             voice_result = count_distinct_voices(audio_wav_path, speech_segments)
 
-            num_speakers = voice_result["num_speakers"]
+            num_speakers    = voice_result["num_speakers"]
             flagged_segments = voice_result["flagged_segments"]
             diarization_confidence = voice_result["confidence"]
 
@@ -124,7 +134,7 @@ def process_job(job_id: str):
             logger.info("No audio track found — skipping audio analysis.")
 
         # ----------------------------------------------------------------
-        # Step 4: Visual detection on sampled frames
+        # Step 5: Visual detection on sampled frames
         # ----------------------------------------------------------------
         logger.info(f"Running visual detection on {len(frames_list)} frames...")
         frame_detections: List[Dict[str, Any]] = []
@@ -137,7 +147,14 @@ def process_job(job_id: str):
                 x1, y1, x2, y2 = faces[0]["box"]
                 face_crop = frame_img[max(0, y1):y2, max(0, x1):x2]
                 if face_crop.size > 0:
-                    sim = verify_identity(face_crop, job.enrollment_photo_s3_uri, job.candidate_id)
+                    # Pass job_temp_dir so the enrollment photo is downloaded once
+                    # and reused across all frames (natural per-job download cache)
+                    sim = verify_identity(
+                        face_crop,
+                        job.enrollment_photo_s3_uri,
+                        job.candidate_id,
+                        job_temp_dir,
+                    )
                     if sim < 0.6:
                         identity_mismatch_conf = 1.0 - sim
 
@@ -159,7 +176,7 @@ def process_job(job_id: str):
             frame_detections.append(fd)
 
         # ----------------------------------------------------------------
-        # Step 5: Aggregate → Score
+        # Step 6: Aggregate → Score
         # ----------------------------------------------------------------
         aggregator = EventAggregator()
         raw_violations = aggregator.aggregate(frame_detections, audio_violations)
@@ -167,8 +184,8 @@ def process_job(job_id: str):
         # Roll up identity mismatch frames into a single violation span
         mismatch_frames = [fd for fd in frame_detections if "identity_mismatch" in fd]
         if mismatch_frames:
-            start_m = mismatch_frames[0]["timestamp"]
-            end_m   = mismatch_frames[-1]["timestamp"]
+            start_m  = mismatch_frames[0]["timestamp"]
+            end_m    = mismatch_frames[-1]["timestamp"]
             avg_conf = sum(fd["identity_mismatch"] for fd in mismatch_frames) / len(mismatch_frames)
             raw_violations.append({
                 "type": "IDENTITY_MISMATCH",
@@ -184,7 +201,7 @@ def process_job(job_id: str):
         overall_score = scorer.calculate_score(raw_violations)
 
         # ----------------------------------------------------------------
-        # Step 6: Persist violations + evidence frames (O(log N) lookup)
+        # Step 7: Persist violations + evidence frames (O(log N) lookup)
         # ----------------------------------------------------------------
         for violation in raw_violations:
             closest_frame = find_nearest_frame(frames_list, violation["start_ts"])
@@ -208,7 +225,7 @@ def process_job(job_id: str):
             ))
 
         # ----------------------------------------------------------------
-        # Step 7: Finalize job
+        # Step 8: Finalize job
         # ----------------------------------------------------------------
         job.overall_score = overall_score
         job.status = "COMPLETED"
@@ -225,12 +242,15 @@ def process_job(job_id: str):
         logger.error(f"Pipeline error for job {job_id}: {err_msg}")
 
         job.status = "FAILED"
-        job.error_message = err_msg[:4000]  # Truncate to DB column limit
+        job.error_message = err_msg[:4000]
         db.commit()
         _dispatch_webhook_async(job)
 
     finally:
         db.close()
+        # Always clean up all ephemeral processing files for this job
+        shutil.rmtree(job_temp_dir, ignore_errors=True)
+        logger.debug(f"Temp dir cleaned up: {job_temp_dir}")
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +263,6 @@ def _dispatch_webhook_async(job: Job):
     """
     if not job.webhook_url:
         return
-    # Snapshot job data before the DB session is closed
     payload = {
         "job_id": job.id,
         "candidate_id": job.candidate_id,
@@ -267,7 +286,7 @@ def _send_webhook(webhook_url: str, payload: dict):
     Runs in a daemon thread — does NOT block the calling worker.
     """
     max_retries = settings.WEBHOOK_MAX_RETRIES
-    timeout = settings.WEBHOOK_TIMEOUT
+    timeout     = settings.WEBHOOK_TIMEOUT
 
     for attempt in range(1, max_retries + 1):
         try:

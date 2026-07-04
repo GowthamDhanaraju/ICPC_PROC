@@ -11,12 +11,20 @@ class Settings(BaseSettings):
     # --- Application Environment ---
     ENV: str = "development"  # "development" | "production"
 
-    # --- AWS & S3 ---
+    # --- AWS S3 ---
     AWS_ACCESS_KEY_ID: Optional[str] = None
     AWS_SECRET_ACCESS_KEY: Optional[str] = None
     AWS_REGION: str = "us-east-1"
     SOURCE_S3_BUCKET: str = "proctoring-incoming"
     RESULTS_S3_BUCKET: str = "proctoring-results"
+
+    # --- MinIO (S3-compatible object storage) ---
+    # Set MINIO_ENDPOINT to point at your MinIO server (e.g. "localhost:9000").
+    # When set, all uploads and downloads are routed through MinIO instead of AWS S3.
+    MINIO_ENDPOINT: Optional[str] = None          # host:port, no scheme
+    MINIO_ACCESS_KEY: Optional[str] = None        # MinIO root user / access key
+    MINIO_SECRET_KEY: Optional[str] = None        # MinIO root password / secret key
+    MINIO_USE_SSL: bool = False                    # Set True when MinIO is behind HTTPS
 
     # --- Database ---
     DATABASE_URL: str = "sqlite:///./proctoring.db"
@@ -70,24 +78,11 @@ class Settings(BaseSettings):
     # When True, /test/* routes are mounted (never enable in production)
     TESTING_MODE: bool = False
 
-    # --- Local Storage (S3 fallback for local dev) ---
-    LOCAL_STORAGE_DIR: str = "./storage"
-
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore"
     )
-
-    def ensure_local_dirs(self):
-        """
-        Creates local mock storage directories.
-        Must be called explicitly at startup, NOT at import time,
-        to avoid side-effects in read-only container environments and tests.
-        """
-        os.makedirs(self.LOCAL_STORAGE_DIR, exist_ok=True)
-        os.makedirs(os.path.join(self.LOCAL_STORAGE_DIR, self.SOURCE_S3_BUCKET), exist_ok=True)
-        os.makedirs(os.path.join(self.LOCAL_STORAGE_DIR, self.RESULTS_S3_BUCKET), exist_ok=True)
 
 
 settings = Settings()

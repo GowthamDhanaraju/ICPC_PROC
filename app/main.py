@@ -40,7 +40,6 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Startup and shutdown lifecycle manager."""
     logger.info("=== Proctoring API starting up ===")
-    settings.ensure_local_dirs()
     init_db()
     global_queue.start(num_workers=settings.WORKER_CONCURRENCY)
     logger.info(f"Worker queue started with {settings.WORKER_CONCURRENCY} threads.")

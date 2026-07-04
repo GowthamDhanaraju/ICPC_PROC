@@ -2,6 +2,7 @@ import os
 import sys
 import argparse
 import time
+import tempfile
 import threading
 import cv2
 import numpy as np
@@ -22,19 +23,12 @@ def generate_dummy_video(path: str, duration_sec: float = 15.0, fps: float = 10.
     
     total_frames = int(duration_sec * fps)
     for i in range(total_frames):
-        # Create a black frame
         frame = np.zeros((height, width, 3), dtype=np.uint8)
-        
-        # Draw target details
         ts = i / fps
         cv2.putText(frame, f"Time: {ts:.1f}s", (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
         cv2.putText(frame, "Batch Proctoring E2E Demo Video", (30, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        
-        # Simulate some visual movement to check adaptive sampling (scene motion)
-        # Shift a drawn white rectangle across the screen
         x_pos = int((ts * 30) % (width - 100))
         cv2.rectangle(frame, (x_pos, 200), (x_pos + 100, 300), (255, 0, 0), -1)
-        
         out.write(frame)
         
     out.release()
@@ -47,7 +41,6 @@ def run_api_server(host: str = "127.0.0.1"):
 def wait_for_server(url: str = "http://127.0.0.1:8000/health", timeout: float = 60.0):
     """
     Waits for the background FastAPI server to open port 8000 and boot up.
-    Uses /health which is always mounted regardless of TESTING_MODE.
     """
     import requests
     print("Waiting for API server to boot up...")
@@ -69,10 +62,8 @@ def run_sqs_worker():
     from app.orchestration.queue import SQSListener, global_queue
     
     init_db()
-    # Start internal queue workers
     global_queue.start(num_workers=2)
     
-    # Configure SQS listener if queue URL is set
     sqs_url = os.getenv("SQS_QUEUE_URL")
     if not sqs_url:
         print("Error: SQS_QUEUE_URL environment variable is not set. Standalone worker exiting.")
@@ -92,49 +83,42 @@ def run_sqs_worker():
 def run_e2e_test():
     """
     Executes a complete local end-to-end integration flow:
-    1. Generates a dummy MP4 video.
+    1. Generates a dummy MP4 video in a system temp directory.
     2. Spins up FastAPI server on a background thread.
-    3. Uses ProctoringClient SDK to submit a job.
+    3. Uses ProctoringClient SDK to submit a job (local abs path as URI).
     4. Polls job status until completion.
     5. Displays score and timeline violations.
-    6. Shuts down and exits.
     """
     print("=== STARTING END-TO-END PROCTORING PIPELINE TEST ===")
 
-    # Ensure database is initialized
-    settings.TESTING_MODE = True  # Mutate singleton so test router mounts correctly
+    settings.TESTING_MODE = True
     init_db()
     
-    # Define file paths
-    video_key = "test_candidate/exam_video.mp4"
-    local_video_path = os.path.join(settings.LOCAL_STORAGE_DIR, settings.SOURCE_S3_BUCKET, video_key)
+    # Write the test video to a system temp dir (not ./storage/)
+    test_temp_dir = tempfile.mkdtemp(prefix="proctoring_e2e_")
+    local_video_path = os.path.join(test_temp_dir, "exam_video.mp4")
     
-    # Generate dummy video
-    generate_dummy_video(local_video_path, duration_sec=120.0, fps=10.0) # 120s video covers all mock violation ranges
+    generate_dummy_video(local_video_path, duration_sec=120.0, fps=10.0)
     
-    # Spin up server in background thread
     server_thread = threading.Thread(target=run_api_server, daemon=True)
     server_thread.start()
-    
-    # Wait for server to boot
     wait_for_server()
     
-    # Initialize client and submit job
     client = ProctoringClient("http://127.0.0.1:8000")
     
-    s3_uri = f"s3://{settings.SOURCE_S3_BUCKET}/{video_key}"
+    # Submit the absolute local path directly — get_local_path() returns it as-is
+    # because os.path.exists() is True.  No MinIO download needed for tests.
     webhook_url = "http://127.0.0.1:8000/test/webhook-target"
     
-    print(f"Submitting job via Client SDK for {s3_uri}...")
+    print(f"Submitting job via Client SDK for {local_video_path}...")
     res = client.submit_session(
         candidate_id="candidate_123",
-        video_s3_uri=s3_uri,
+        video_s3_uri=local_video_path,   # absolute path, passes schema validator
         webhook_url=webhook_url
     )
     job_id = res["job_id"]
     print(f"Job submitted! Job ID: {job_id}")
     
-    # Poll status
     print("Polling job status until execution completes...")
     try:
         final_result = client.poll_session_until_complete(job_id, interval=1.0, timeout=120.0)
@@ -147,7 +131,6 @@ def run_e2e_test():
             if v['evidence_frame_s3_uri']:
                 print(f"   Evidence S3 URI: {v['evidence_frame_s3_uri']}")
                 
-        # Query received webhooks on the test endpoint to verify webhook delivery
         import requests
         hooks_res = requests.get("http://127.0.0.1:8000/test/webhook-received")
         if hooks_res.status_code == 200 and len(hooks_res.json()) > 0:
@@ -159,6 +142,9 @@ def run_e2e_test():
     except Exception as e:
         print(f"E2E test failed with error: {e}")
         sys.exit(1)
+    finally:
+        import shutil
+        shutil.rmtree(test_temp_dir, ignore_errors=True)
         
     print("\n=== E2E TEST COMPLETED SUCCESSFULLY ===")
 
@@ -166,9 +152,7 @@ import re
 import requests
 
 def parse_gdrive_id(url: str) -> str:
-    """
-    Parses Google Drive share URL and extracts the file ID.
-    """
+    """Parses Google Drive share URL and extracts the file ID."""
     match = re.search(r'/file/d/([a-zA-Z0-9_-]+)', url)
     if match:
         return match.group(1)
@@ -180,20 +164,15 @@ def parse_gdrive_id(url: str) -> str:
     raise ValueError(f"Could not extract Google Drive File ID from: {url}")
 
 def download_gdrive_file(file_id: str, dest_path: str):
-    """
-    Downloads a publicly accessible file from Google Drive using the gdown library.
-    """
+    """Downloads a publicly accessible file from Google Drive using gdown."""
     import gdown
     url = f"https://drive.google.com/uc?id={file_id}"
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
     print(f"Connecting and downloading file ID: {file_id} via gdown...")
-    # gdown automatically handles virus warnings and chunks large downloads
     gdown.download(url, dest_path, quiet=False, use_cookies=False)
 
 def run_gdrive_test(url: str, candidate_id: str):
-    """
-    Downloads a Google Drive video file and runs the local proctoring pipeline on it.
-    """
+    """Downloads a Google Drive video and runs the local proctoring pipeline on it."""
     if not url:
         print("Error: --url parameter is required when running test-gdrive mode.")
         sys.exit(1)
@@ -203,11 +182,11 @@ def run_gdrive_test(url: str, candidate_id: str):
     except Exception as e:
         print(f"URL Parsing Error: {e}")
         sys.exit(1)
-        
-    video_key = f"gdrive_{file_id}/video.mp4"
-    local_video_path = os.path.join(settings.LOCAL_STORAGE_DIR, settings.SOURCE_S3_BUCKET, video_key)
+
+    # Download to a system temp dir
+    test_temp_dir = tempfile.mkdtemp(prefix=f"proctoring_gdrive_{file_id[:8]}_")
+    local_video_path = os.path.join(test_temp_dir, "video.mp4")
     
-    # Download file from Google Drive if it doesn't already exist
     if not os.path.exists(local_video_path):
         try:
             download_gdrive_file(file_id, local_video_path)
@@ -215,35 +194,28 @@ def run_gdrive_test(url: str, candidate_id: str):
             print(f"Failed to download Google Drive video: {e}")
             sys.exit(1)
     else:
-        print(f"Google Drive video already downloaded at: {local_video_path}")
+        print(f"Google Drive video already at: {local_video_path}")
         
-    # Ensure database is initialized
-    settings.TESTING_MODE = True  # Mutate singleton so test router mounts correctly
+    settings.TESTING_MODE = True
     init_db()
     
-    # Spin up server in background thread
     server_thread = threading.Thread(target=run_api_server, daemon=True)
     server_thread.start()
-    
-    # Wait for server to boot
     wait_for_server()
     
-    # Initialize client and submit job
     client = ProctoringClient("http://127.0.0.1:8000")
-    s3_uri = f"s3://{settings.SOURCE_S3_BUCKET}/{video_key}"
     webhook_url = "http://127.0.0.1:8000/test/webhook-target"
     
-    print(f"Submitting job via Client SDK for {s3_uri}...")
+    print(f"Submitting job via Client SDK for {local_video_path}...")
     res = client.submit_session(
         candidate_id=candidate_id,
-        video_s3_uri=s3_uri,
+        video_s3_uri=local_video_path,
         webhook_url=webhook_url
     )
     job_id = res["job_id"]
     print(f"Job submitted! Job ID: {job_id}")
     
-    # Poll status
-    print("Polling job status until execution completes...")
+    print("Polling until pipeline completes...")
     try:
         final_result = client.poll_session_until_complete(job_id, interval=2.0, timeout=600.0)
         print("\n=== PIPELINE EXECUTION COMPLETED ===")
@@ -257,11 +229,14 @@ def run_gdrive_test(url: str, candidate_id: str):
     except Exception as e:
         print(f"Gdrive test run failed: {e}")
         sys.exit(1)
+    finally:
+        import shutil
+        shutil.rmtree(test_temp_dir, ignore_errors=True)
 
 def run_local_test(video_path: str, candidate_id: str):
     """
     Runs the proctoring pipeline directly on a local video file.
-    Skips all download steps — useful for re-testing an already-downloaded file.
+    No temp dir management needed — the file is already on disk.
     """
     if not video_path:
         print("Error: --file parameter is required for test-local mode.")
@@ -277,42 +252,20 @@ def run_local_test(video_path: str, candidate_id: str):
     print(f"Video: {video_path} ({file_size_mb:.1f} MB)")
     print(f"Candidate: {candidate_id}")
 
-    # Build a relative S3-like key from the path so the worker resolves it correctly
-    # The S3 URI will map back to the absolute local path via get_local_path()
-    video_key = f"local/{candidate_id}/video.mp4"
-    local_storage_dir = os.path.abspath(settings.LOCAL_STORAGE_DIR)
-    dest_path = os.path.join(local_storage_dir, settings.SOURCE_S3_BUCKET, video_key)
-    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-
-    # Symlink or copy if not already at destination
-    if os.path.abspath(dest_path) != video_path:
-        if os.path.exists(dest_path):
-            os.remove(dest_path)
-        try:
-            os.symlink(video_path, dest_path)
-        except (OSError, NotImplementedError):
-            import shutil
-            shutil.copy2(video_path, dest_path)
-        print(f"Linked video into storage: {dest_path}")
-    else:
-        print(f"Video already at storage path.")
-
-    settings.TESTING_MODE = True  # Mutate singleton so test router mounts correctly
+    settings.TESTING_MODE = True
     init_db()
 
-    # Spin up server
     server_thread = threading.Thread(target=run_api_server, daemon=True)
     server_thread.start()
     wait_for_server()
 
     client = ProctoringClient("http://127.0.0.1:8000")
-    s3_uri = f"s3://{settings.SOURCE_S3_BUCKET}/{video_key}"
     webhook_url = "http://127.0.0.1:8000/test/webhook-target"
 
-    print(f"Submitting job for {s3_uri}...")
+    print(f"Submitting job for {video_path}...")
     res = client.submit_session(
         candidate_id=candidate_id,
-        video_s3_uri=s3_uri,
+        video_s3_uri=video_path,   # absolute path passed directly
         webhook_url=webhook_url
     )
     job_id = res["job_id"]

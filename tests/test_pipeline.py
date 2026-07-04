@@ -73,6 +73,14 @@ def test_config():
     assert not hasattr(settings, "WHISPER_MODEL_SIZE"), (
         "WHISPER_MODEL_SIZE should have been removed from config"
     )
+    # LOCAL_STORAGE_DIR should no longer exist (all storage is MinIO/S3)
+    assert not hasattr(settings, "LOCAL_STORAGE_DIR"), (
+        "LOCAL_STORAGE_DIR should have been removed — storage is now MinIO only"
+    )
+    # MinIO config fields should exist (even if unpopulated in test env)
+    assert hasattr(settings, "MINIO_ENDPOINT")
+    assert hasattr(settings, "MINIO_ACCESS_KEY")
+    assert hasattr(settings, "MINIO_SECRET_KEY")
 
 
 # ---------------------------------------------------------------------------

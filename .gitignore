@@ -8,7 +8,7 @@ __pycache__/
 *.db
 *.sqlite3
 
-# Local storage mocks and S3 downlods
+# Ephemeral per-job temp dirs (should never be committed)
 storage/
 
 # OS files
