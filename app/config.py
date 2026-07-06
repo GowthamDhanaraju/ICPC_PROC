@@ -56,8 +56,8 @@ class Settings(BaseSettings):
     INSIGHTFACE_CTX_ID: int = -1
 
     # --- Visual Detection Thresholds ---
-    FACE_CONFIDENCE_THRESHOLD: float = 0.5
-    GADGET_CONFIDENCE_THRESHOLD: float = 0.5
+    FACE_CONFIDENCE_THRESHOLD: float = 0.8
+    GADGET_CONFIDENCE_THRESHOLD: float = 0.8
     GAZE_AWAY_PITCH_THRESHOLD: float = 15.0   # degrees
     GAZE_AWAY_YAW_THRESHOLD: float = 20.0      # degrees
 
