@@ -63,12 +63,7 @@ def get_gadget_model() -> Optional[Any]:
                     _GADGET_MODEL = YOLO("yolov8s.pt")
                     logger.info("YOLOv8s gadget model loaded.")
                 except Exception as exc:
-                    logger.error(f"Failed to load YOLOv8s: {exc}. Trying nano fallback...")
-                    try:
-                        _GADGET_MODEL = YOLO("yolov8n.pt")
-                        logger.warning("YOLOv8n (nano fallback) loaded for gadget detection.")
-                    except Exception as exc2:
-                        logger.error(f"YOLOv8n fallback also failed: {exc2}")
+                    logger.error(f"Failed to load YOLOv8s: {exc}")
     return _GADGET_MODEL
 
 

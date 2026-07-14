@@ -197,34 +197,8 @@ def upload_report(job_id: str, filename: str, report_json_str: str) -> Optional[
         return None
 
 
-def upload_overlay_video(job_id: str, filename: str, video_path: str) -> Optional[str]:
-    """
-    Uploads the generated overlay MP4 video to MinIO/S3.
-    Returns the object URI, or None if no object storage is configured or upload fails.
-    """
-    if not _is_object_storage_configured():
-        return None
 
-    if not os.path.exists(video_path):
-        logger.warning(f"Overlay video not found for upload: {video_path}")
-        return None
 
-    s3_key = f"results/{job_id}/{filename}"
-    s3_uri = f"s3://{settings.RESULTS_S3_BUCKET}/{s3_key}"
-
-    try:
-        s3 = get_s3_client()
-        s3.upload_file(
-            video_path,
-            settings.RESULTS_S3_BUCKET,
-            s3_key,
-            ExtraArgs={"ContentType": "video/mp4"}
-        )
-        logger.info(f"Overlay video uploaded → {s3_uri}")
-        return s3_uri
-    except Exception as exc:
-        logger.warning(f"Overlay video upload failed for job {job_id}: {exc}")
-        return None
 
 
 # ---------------------------------------------------------------------------

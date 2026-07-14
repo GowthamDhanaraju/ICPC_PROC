@@ -37,29 +37,16 @@ class Settings(BaseSettings):
     # --- ML Model Toggle ---
     MOCK_ML_MODELS: bool = True  # Set to False on production server
 
-    # --- Model Backend Selection ---
-    # Face detection backend: "insightface" | "yolo" | "haar"
-    FACE_BACKEND: str = "insightface"
-    # Identity verification backend: "arcface" | "lbph"
-    IDENTITY_BACKEND: str = "arcface"
-    # Gaze/head pose backend: "6drepnet" | "mediapipe"
-    GAZE_BACKEND: str = "6drepnet"
-    # VAD backend: "silero" | "rms"
-    VAD_BACKEND: str = "silero"
-    # Diarization backend: "resemblyzer" | "pyannote"
-    DIARIZATION_BACKEND: str = "resemblyzer"
-
-    # --- HuggingFace (optional, for pyannote diarization) ---
-    HUGGINGFACE_TOKEN: Optional[str] = None
-
     # --- InsightFace GPU context (-1 = CPU) ---
     INSIGHTFACE_CTX_ID: int = -1
 
     # --- Visual Detection Thresholds ---
-    FACE_CONFIDENCE_THRESHOLD: float = 0.8
-    GADGET_CONFIDENCE_THRESHOLD: float = 0.8
-    GAZE_AWAY_PITCH_THRESHOLD: float = 15.0   # degrees
-    GAZE_AWAY_YAW_THRESHOLD: float = 20.0      # degrees
+    # Raised to 0.90 to eliminate borderline false-positive detections.
+    FACE_CONFIDENCE_THRESHOLD: float = 0.90
+    GADGET_CONFIDENCE_THRESHOLD: float = 0.90
+    # Stricter gaze thresholds — only sustained, deliberate head turns are flagged.
+    GAZE_AWAY_PITCH_THRESHOLD: float = 20.0   # degrees (raised from 15°)
+    GAZE_AWAY_YAW_THRESHOLD: float = 25.0      # degrees (raised from 20°)
 
     # --- Adaptive Frame Sampling (seconds) ---
     ADAPTIVE_SAMPLING_BASELINE_INTERVAL: float = 1.6
@@ -77,10 +64,6 @@ class Settings(BaseSettings):
     # --- Testing ---
     # When True, /test/* routes are mounted (never enable in production)
     TESTING_MODE: bool = False
-
-    # --- Debug Features ---
-    # When True, generates an MP4 with bounding boxes/gaze lines and uploads it to MinIO
-    RENDER_OVERLAY_VIDEO: bool = False
 
     model_config = SettingsConfigDict(
         env_file=".env",

@@ -274,7 +274,7 @@ def build_report(
         if "identity_mismatch" not in fd:
             continue
         mismatch_conf = float(fd["identity_mismatch"])
-        flagged = mismatch_conf >= 0.4  # mismatch_conf = 1 - similarity
+        flagged = mismatch_conf >= 0.50  # matches worker threshold (1 - sim < 0.50)
 
         identity_timeline.append({
             "timestamp_s": round(ts, 3),
@@ -371,7 +371,7 @@ def build_report(
         "identity_mismatch": {
             "description": (
                 "Periods where the detected face did not match the enrollment photo "
-                "(mismatch_confidence >= 0.4)."
+                "(mismatch_confidence >= 0.50, i.e. ArcFace similarity < 0.50)."
             ),
             "windows": _ts_windows(
                 identity_mismatch_flags, merge_gap=5.0, min_duration=0.0

@@ -1,14 +1,16 @@
 """
 Core job execution pipeline for the Batch Video Proctoring System.
 
-Changes from original:
-- Scoring system (ScoringEngine, EventAggregator, overall_score, violations DB table)
-  has been removed entirely.
-- The pipeline now calls build_report() to produce a structured JSON observation log
-  and saves it to reports/<job_id>.json.
-- Audio extraction and video frame sampling still run concurrently.
-- Webhook payload updated: contains report_path instead of score/violations.
-- Uploads the resulting JSON report to MinIO/S3.
+Pipeline stages:
+  1. Fetch job & mark PROCESSING.
+  2. Create a per-job temp directory for all ephemeral files.
+  3. Audio extraction + Video frame sampling — run concurrently.
+  4. Run VAD → Voice Count Diarization on audio.
+  5. Run face / gaze / gadget detection on sampled frames.
+  6. Build structured JSON report from all detection outputs.
+  7. Save report to disk and upload to MinIO/S3.
+  8. Commit results, fire webhook asynchronously.
+  9. Clean up the per-job temp directory (always runs, even on failure).
 """
 import json
 import logging
@@ -37,10 +39,8 @@ from app.preprocessing.media import (
     get_local_path,
     sample_video_frames,
     upload_report,
-    upload_overlay_video,
 )
 from app.reporting.report import build_report, save_report
-from app.reporting.overlay import render_overlay_video
 
 logger = logging.getLogger(__name__)
 
@@ -179,7 +179,8 @@ def process_job(job_id: str):
                         job.candidate_id,
                         job_temp_dir,
                     )
-                    if sim < 0.6:
+                    # Threshold raised to 0.50: only flag clear mismatches.
+                    if sim < 0.50:
                         identity_mismatch_conf = 1.0 - sim
 
             gaze: Dict[str, float] = {"yaw": 0.0, "pitch": 0.0, "roll": 0.0}
@@ -227,18 +228,6 @@ def process_job(job_id: str):
         s3_uri = upload_report(job.id, report_filename, json.dumps(report, ensure_ascii=False))
 
         final_report_path = s3_uri or saved_path
-
-        # ----------------------------------------------------------------
-        # Step 7.5: Generate & Upload Overlay Video (if enabled)
-        # ----------------------------------------------------------------
-        if settings.RENDER_OVERLAY_VIDEO:
-            logger.info("Overlay video rendering enabled. Generating MP4...")
-            overlay_path = os.path.join(job_temp_dir, f"overlay_{job.id}.mp4")
-            if render_overlay_video(frames_list, frame_detections, overlay_path):
-                overlay_filename = f"{video_basename}_result.mp4"
-                overlay_s3_uri = upload_overlay_video(job.id, overlay_filename, overlay_path)
-                if overlay_s3_uri:
-                    logger.info(f"Overlay video successfully uploaded to {overlay_s3_uri}")
 
         # ----------------------------------------------------------------
         # Step 8: Finalize job
